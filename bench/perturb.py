@@ -155,12 +155,20 @@ def apply_false_positives_dropouts(
     rng: np.random.Generator,
     fp_jump_px: float = 60.0,
 ) -> TrackSequence:
-    """Inject spurious detections and isolated missed frames.
+    """False-negative dropouts plus false-positive-style outlier *displacement*.
 
     With probability ``drop_rate`` each detection is removed (an isolated false negative).
-    Surviving detections are kept with probability ``1`` but, with probability ``fp_rate``,
-    are *displaced* by a large random jump of scale ``fp_jump_px`` to mimic a spurious
-    detection latching onto the wrong location. Both rates are per-frame in ``[0, 1]``.
+    With probability ``fp_rate`` a surviving detection is *displaced* by a large random jump
+    of scale ``fp_jump_px`` — the tracker latching onto a spurious nearby location. Both
+    rates are per-frame in ``[0, 1]``.
+
+    Scope note (honest labelling): because a :class:`TrackSequence` is one object's track
+    with strictly-increasing frames, this models a false positive as a *displaced* existing
+    detection, not an *extra* injected box (which would need a duplicate/extra frame the
+    schema forbids for a single track). It therefore exercises outlier-displacement
+    robustness — what RANSAC/IRLS must reject — rather than ghost-track injection. Genuine
+    spurious-track injection is a multi-track concern (a separate ghost id), out of scope for
+    this single-track corruption.
     """
     if not 0.0 <= fp_rate <= 1.0 or not 0.0 <= drop_rate <= 1.0:
         raise ValueError("fp_rate and drop_rate must be in [0, 1]")

@@ -162,6 +162,11 @@ def degradation_sweep(
                     cfg = CorruptionConfig(jitter_sigma_px=level, jitter_rho=0.6)
                 elif field == "fp_rate":
                     cfg = CorruptionConfig(fp_rate=level)
+                elif field == "gap_burst_len":
+                    # Occlusion / false-negative bursts (§11, §14.2): remove two runs of
+                    # `level` consecutive frames. Tests gap/observation-density robustness —
+                    # the moat axis the published curves previously omitted.
+                    cfg = CorruptionConfig(gap_burst_len=int(level), n_gap_bursts=2)
                 else:
                     raise ValueError(f"unsupported sweep field: {field}")
             true_speed = float(gt.speed[0])
@@ -343,6 +348,7 @@ def main(*, smoke: bool = False) -> None:
 
     fp_curve = degradation_sweep("fp_rate", [0.0, 0.1, 0.2, 0.3, 0.4, 0.5])
     jitter_curve = degradation_sweep("jitter_sigma_px", [0.0, 1.0, 2.0, 4.0, 6.0, 8.0])
+    gap_curve = degradation_sweep("gap_burst_len", [0.0, 2.0, 4.0, 8.0, 12.0])
     drag_curve = degradation_sweep("drag_coeff", [0.0, 0.1, 0.2, 0.47, 1.0])
     gate = run_gate()
     rel, clean_err = run_calibration()
@@ -353,6 +359,8 @@ def main(*, smoke: bool = False) -> None:
                 REPORT_DIR / "degradation_false_positives.png")
     _plot_curve(jitter_curve, "Degradation under correlated jitter", "jitter sigma (px)",
                 REPORT_DIR / "degradation_jitter.png")
+    _plot_curve(gap_curve, "Degradation under gap bursts (occlusion)", "gap burst length (frames)",
+                REPORT_DIR / "degradation_gap_bursts.png")
     _plot_curve(drag_curve, "Model mismatch: pure-quadratic fit vs true drag", "drag coefficient",
                 REPORT_DIR / "model_mismatch_drag.png")
     _plot_reliability(rel, REPORT_DIR / "reliability.png")
@@ -362,6 +370,7 @@ def main(*, smoke: bool = False) -> None:
         "headline_arc_drag_coeff": 0.2,
         "degradation_false_positives": fp_curve.__dict__,
         "degradation_jitter": jitter_curve.__dict__,
+        "degradation_gap_bursts": gap_curve.__dict__,
         "model_mismatch_drag": drag_curve.__dict__,
         "calibration": {"ece": float(ece), "bin_centers": centers.tolist(),
                         "empirical_acc": [None if not np.isfinite(a) else float(a) for a in acc],
@@ -371,7 +380,9 @@ def main(*, smoke: bool = False) -> None:
     }
     (REPORT_DIR / "report.json").write_text(json.dumps(report, indent=2))
 
-    md = _render_markdown(clean_err, fp_curve, jitter_curve, drag_curve, gate, float(ece), real)
+    md = _render_markdown(
+        clean_err, fp_curve, jitter_curve, gap_curve, drag_curve, gate, float(ece), real
+    )
     (REPORT_DIR / "report.md").write_text(md)
     print(md)
     print(f"\nWrote plots + report.json + report.md to {REPORT_DIR}")
@@ -401,6 +412,7 @@ def _render_markdown(
     clean_err: float,
     fp: Curve,
     jitter: Curve,
+    gap: Curve,
     drag: Curve,
     gate: dict[str, float],
     ece: float,
@@ -440,6 +452,14 @@ def _render_markdown(
         f"level     {_fmt(jitter.levels)}",
         f"baseline  {_fmt(jitter.baseline_err)}",
         f"robust    {_fmt(jitter.robust_err)}",
+        "```",
+        "",
+        "**Gap bursts (occlusion)** — length of each of two dropped frame-runs (§11 occlusion /",
+        "false-negative robustness). The fit must stay accurate as observations are removed.",
+        "```",
+        f"gap_len   {_fmt(gap.levels)}",
+        f"baseline  {_fmt(gap.baseline_err)}",
+        f"robust    {_fmt(gap.robust_err)}",
         "```",
         "",
         "**Model mismatch — true drag coefficient** (no corruption; both fits share the",

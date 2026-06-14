@@ -31,6 +31,14 @@ baseline   0.01   0.01   0.04   0.04   0.07   0.08
 robust     0.01   0.01   0.04   0.03   0.07   0.08
 ```
 
+**Gap bursts (occlusion)** — length of each of two dropped frame-runs (§11 occlusion /
+false-negative robustness). The fit must stay accurate as observations are removed.
+```
+gap_len    0.00   2.00   4.00   8.00  12.00
+baseline   0.01   0.00   0.01   0.01   0.01
+robust     0.01   0.01   0.01   0.01   0.01
+```
+
 **Model mismatch — true drag coefficient** (no corruption; both fits share the
 pure-quadratic model bias, so the curve is the honest model-mismatch error):
 ```

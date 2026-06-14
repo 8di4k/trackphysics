@@ -372,3 +372,19 @@ def test_gate_precision_recall_never_metric() -> None:
     assert res["recall"] == 0.0
     assert res["f1"] == 0.0
     assert res["fp"] == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# degradation_sweep: the gap-burst (occlusion) axis is wired and meaningful
+# --------------------------------------------------------------------------- #
+
+
+def test_degradation_sweep_supports_gap_burst_axis() -> None:
+    # Regression guard: the gap-burst (occlusion / §11) axis must be a supported sweep field
+    # and produce a finite degradation curve, not raise "unsupported sweep field".
+    from bench.run import degradation_sweep
+
+    curve = degradation_sweep("gap_burst_len", [0.0, 4.0, 8.0], n_seeds=3)
+    assert curve.levels == [0.0, 4.0, 8.0]
+    assert len(curve.robust_err) == 3
+    assert all(np.isfinite(e) for e in curve.robust_err)
