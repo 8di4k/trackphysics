@@ -5,6 +5,12 @@ principle: **success = calibration, not accuracy.** A metric speed that is 8% of
 if the engine's stated CI covers the truth; a 3%-off estimate with a tight CI that excludes
 the truth FAILs (overconfident).
 
+> **Standing real-data eval.** [`run_tt3d.py`](run_tt3d.py) is the permanent real-data eval
+> against independent multi-camera 3D (TT3D). It has been run (2026-06-14): the architecture
+> held but the quantitative CI provenance was **falsified** off-regime — see the measured
+> limitations in [`../DECISIONS.md`](../DECISIONS.md). Quantitative numbers are kept internal
+> (TT3D is all-rights-reserved); this repo records the qualitative diagnosis only.
+
 ## Ground truth must be INDEPENDENT (not monocular-reconstructed)
 
 You cannot validate a gravity-derived metric against a dataset whose own 3D was built from
