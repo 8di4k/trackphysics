@@ -41,14 +41,14 @@ def main() -> None:
                 return
             s = report.summary()
             tag = f"{view}{'' if noisy else '_clean'}"
+            counts = f"{int(s.get('n_metric', 0)):>5d}/{int(s['n_total']):<7d}"
             if s.get("n_metric", 0) > 0:
                 inplane = f"{s['mean_inplane_error_m_s']:.2f}/{s['median_inplane_error_m_s']:.2f}"
-                print(
-                    f"{tag:16s} {int(s['n_metric']):>5d}/{int(s['n_total']):<7d} "
-                    f"{inplane:>18s} {s['mean_full3d_error_m_s']:>7.2f} {s['ci_coverage_rate']:>8.2f}"
-                )
+                full3d = s["mean_full3d_error_m_s"]
+                cover = s["ci_coverage_rate"]
+                print(f"{tag:16s} {counts} {inplane:>18s} {full3d:>7.2f} {cover:>8.2f}")
             else:
-                print(f"{tag:16s} {int(s.get('n_metric', 0)):>5d}/{int(s['n_total']):<7d}  (no metric)")
+                print(f"{tag:16s} {counts}  (no metric)")
     print(
         "\nin-plane = fair monocular number; full3D large on 'back' = depth-blindness (ball "
         "flies along the optical axis). Low CI coverage = engine overconfident on this "
