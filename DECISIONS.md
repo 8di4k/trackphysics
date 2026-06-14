@@ -148,3 +148,33 @@ over-trusting an in-plane metric; it does not restore the missing 3-D component.
 **Next:** (3) per-deployment refittable calibrator (in-distribution de-bias + input-conditioned
 CI, reusing the same aspect machinery); then default-ON + cross-geometry de-bias once a second
 domain / a viewpoint continuum is available.
+
+---
+
+## 2026-06-15 — (3) implemented: per-deployment refittable calibrator (in-distribution provenance)
+
+`DeploymentCalibrator` (`trackphysics/calibration.py`, public API) is a **calibration layer on
+top of the core** — never inside it (§6). Fit on one deployment's labelled metric emissions
+(fixed geometry), it (Stage 1) de-biases the launch speed and (Stage 2) replaces the fixed
+systematic CI floor with an **input-conditioned** CI, from runtime-observable features the
+estimate already carries. It is a serializable, refittable artifact (`to_dict`/`from_dict`),
+provenance-tagged, valid only for the geometry it was fit on.
+
+- **Engine change (generic, §6-clean):** `core/shape.py` computes the scale-invariant 2D
+  trajectory-shape descriptors (aspect, straightness, PCA angle/eccentricity) as ONE source of
+  truth, exposed in every METRIC estimate's `meta`. The depth guard now reads `shape["aspect"]`
+  from it, and the calibrator reads its whole feature vector off the estimate
+  (`features_from_estimate`) — so fit and apply use identical features. The guardrail test
+  confirms no domain terms entered core.
+- **Measured (internal, TT3D): the per-deployment claim holds.** Pooled in-distribution k-fold:
+  the engine's fixed-floor CI coverage (~0.31, the falsification) rises to **~0.91** with the
+  input-conditioned CI, and the systematic bias drops. This is the reward-for-calibration path:
+  a fixed-rig operator refits on their own geometry and earns an honest CI. (Reproduce:
+  `python -m validation.fit_deployment_calibrator --dump <dump>`.)
+- **Scope, unchanged:** valid IN-DISTRIBUTION only (fixed geometry). Cross-geometry de-bias and
+  promotion of the depth guard to default-ON still await a SECOND domain / a viewpoint
+  continuum. Coefficients are deployment-specific and never hardcoded into the core.
+
+The maturity ladder is now: default path (unchanged) → opt-in depth guard (B, point-only safety
+net, done) → per-deployment calibrator (precision for those who refit, done) → default-ON +
+cross-geometry (awaiting a 2nd domain).

@@ -47,6 +47,7 @@ import numpy.typing as npt
 from .grounding import GroundingContext
 from .provenance import Quantity, Tier, TrajectoryEstimate, combine_confidence
 from .schema import FloatArray, Segment, TrackSequence
+from .shape import inplane_shape_features
 
 BoolArray = npt.NDArray[np.bool_]
 """Alias for a boolean ndarray (inlier masks)."""
@@ -595,6 +596,11 @@ def fit_ballistic(
     residual_factor = float(np.clip(1.0 - residual_fraction / _RESIDUAL_FRACTION_TOL, 0.0, 1.0))
     inlier_factor = float(np.clip(inlier_fraction, 0.0, 1.0))
 
+    # Scale-invariant 2D shape descriptors of the segment (domain-agnostic geometry). Exposed
+    # in the metric meta so a per-deployment calibrator / the depth guard can read the same
+    # observable features the engine saw, without recomputing from the track.
+    shape = inplane_shape_features(centers)
+
     supplied_scale = _scale_from_reference(ctx)
     if supplied_scale is not None:
         # Scale is given outright -> METRIC, with confidence/gof from FIT quality only.
@@ -605,7 +611,9 @@ def fit_ballistic(
         return _build_metric_estimate(
             xfit, yfit, times, supplied_scale, frame_range, segment,
             source="reference_scale", confidence=confidence, gof=gof,
-            meta={"scale_m_per_px": supplied_scale, "a_px": a_px, "completeness": completeness},
+            meta={"scale_m_per_px": supplied_scale, "a_px": a_px, "completeness": completeness,
+                  "residual_fraction": residual_fraction, "inlier_fraction": inlier_fraction,
+                  **shape},
         )
 
     # Gravity-as-a-ruler. The world-vertical maps to image-y; a_px is px/s^2 (downward +).
@@ -648,9 +656,7 @@ def fit_ballistic(
     # depth (that needs stereo/size).
     guard = ctx.depth_guard
     if guard is not None and guard.enabled:
-        extent_h = float(np.ptp(centers[:, 0]))
-        extent_v = float(np.ptp(centers[:, 1]))
-        aspect = extent_h / (extent_v + 1e-9)
+        aspect = shape["aspect"]
         if aspect <= guard.hard_aspect:
             return _relative_fallback(
                 centers, times, frame_range, segment, reason="depth_domination_downgrade",
@@ -673,6 +679,7 @@ def fit_ballistic(
             "inlier_fraction": inlier_fraction,
             "residual_fraction": residual_fraction,
             "completeness": completeness,
+            **shape,
             **guard_meta,
         },
     )

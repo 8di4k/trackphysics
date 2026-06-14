@@ -7,6 +7,7 @@ the three-tier provenance types, the preset protocol + registry, the grounding h
 
 from __future__ import annotations
 
+from .calibration import CALIBRATOR_FEATURES, DeploymentCalibrator, features_from_estimate
 from .core.adapters.generic import from_csv, from_generic
 from .core.adapters.supervision import from_supervision
 from .core.analysis import analyze
@@ -35,9 +36,11 @@ from .core.schema import Detection, FloatArray, Segment, SkeletonGraph, TrackSeq
 __version__ = "0.1.0.dev0"
 
 __all__ = [
+    "CALIBRATOR_FEATURES",
     "AnalysisResult",
     "BounceDetector",
     "DepthDominationGuard",
+    "DeploymentCalibrator",
     "Detection",
     "Event",
     "EventDetector",
@@ -62,6 +65,7 @@ __all__ = [
     "combine_confidence",
     "compute_kinematics",
     "detect_contacts",
+    "features_from_estimate",
     "from_csv",
     "from_generic",
     "from_supervision",

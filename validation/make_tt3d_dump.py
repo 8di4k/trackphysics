@@ -36,6 +36,7 @@ from validation.run_3d_validation import Trajectory3D, _true_velocity, validate_
 
 import trackphysics as tp
 from trackphysics.core.schema import TrackSequence
+from trackphysics.core.shape import inplane_shape_features as geo_features  # single source of truth
 
 
 def apparent_size(track: TrackSequence) -> np.ndarray:
@@ -43,24 +44,6 @@ def apparent_size(track: TrackSequence) -> np.ndarray:
     w = np.abs(b[:, 2] - b[:, 0])
     h = np.abs(b[:, 3] - b[:, 1])
     return np.asarray(np.sqrt(np.maximum(w, 1e-9) * np.maximum(h, 1e-9)), dtype=np.float64)
-
-
-def geo_features(uv: np.ndarray) -> dict[str, float]:
-    """Four scale-invariant trajectory-shape features from the (M, 2) pixel centroids."""
-    if uv.shape[0] < 3:
-        return dict(aspect=np.nan, straightness=np.nan, pca_angle=np.nan, pca_ecc=np.nan)
-    u, v = uv[:, 0], uv[:, 1]
-    aspect = float(np.ptp(u)) / (float(np.ptp(v)) + 1e-9)
-    chord = float(np.hypot(u[-1] - u[0], v[-1] - v[0]))
-    arc = float(np.sum(np.hypot(np.diff(u), np.diff(v))))
-    straightness = chord / (arc + 1e-9)
-    c = uv - uv.mean(axis=0)
-    eigval, eigvec = np.linalg.eigh(c.T @ c / len(c))   # ascending
-    principal = eigvec[:, 1]
-    pca_angle = float(np.arctan2(principal[1], principal[0]) % np.pi)  # undirected -> [0,pi)
-    l1, l2 = float(eigval[1]), float(eigval[0])
-    pca_ecc = float(np.sqrt(max(0.0, 1.0 - l2 / (l1 + 1e-12))))
-    return dict(aspect=aspect, straightness=straightness, pca_angle=pca_angle, pca_ecc=pca_ecc)
 
 
 def gt_depth_frac(traj: Trajectory3D) -> float:
