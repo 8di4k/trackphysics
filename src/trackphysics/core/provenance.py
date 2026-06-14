@@ -9,6 +9,7 @@ lower tier — it never fakes metric.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -119,9 +120,13 @@ def combine_confidence(*factors: float, weights: tuple[float, ...] | None = None
     still subject to empirical *calibration* against the benchmark; this function only
     fixes the combination rule, not the mapping to ground-truth correctness.
 
-    Each factor must lie in ``[0, 1]``. With no factors, returns ``0.0``.
+    Each factor must lie in ``[0, 1]``. A NON-FINITE factor (``NaN``/``inf``) is a *failed*
+    cue, not a perfect one: it is treated as ``0.0`` so it drags confidence down rather than
+    silently inflating it. (Without this guard ``min(1.0, nan)`` returns ``nan`` and the
+    clamp would map ``NaN`` to ``1.0`` — the maximum — quietly fabricating confidence.) With
+    no factors, returns ``0.0``.
     """
-    vals = [max(0.0, min(1.0, f)) for f in factors]
+    vals = [0.0 if not math.isfinite(f) else max(0.0, min(1.0, f)) for f in factors]
     if not vals:
         return 0.0
     if weights is None:
@@ -132,10 +137,18 @@ def combine_confidence(*factors: float, weights: tuple[float, ...] | None = None
         w = np.asarray(weights, dtype=np.float64)
     if np.any(w < 0) or w.sum() <= 0:
         raise ValueError("weights must be non-negative and sum to a positive value")
-    # Weighted geometric mean: exp(sum(w_i * ln v_i) / sum(w_i)); a zero factor -> 0.
-    if any(v == 0.0 for v in vals):
+    # A zero factor is a hard disqualifier ONLY if it actually participates in the mean
+    # (positive weight). A zero-WEIGHTED factor is excluded from the geometric mean, so a
+    # coincidental 0.0 there must not veto the whole result.
+    if any(v == 0.0 and wi > 0.0 for v, wi in zip(vals, w, strict=True)):
         return 0.0
-    log_mean = float(np.sum(w * np.log(vals)) / np.sum(w))
+    # Weighted geometric mean over the positively-weighted factors:
+    # exp(sum(w_i * ln v_i) / sum(w_i)). Zero-weight terms contribute nothing (and their
+    # log(0) would be -inf), so restrict to the positive-weight subset.
+    mask = w > 0.0
+    vm = np.asarray(vals, dtype=np.float64)[mask]
+    wm = w[mask]
+    log_mean = float(np.sum(wm * np.log(vm)) / np.sum(wm))
     return float(np.exp(log_mean))
 
 

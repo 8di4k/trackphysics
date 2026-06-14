@@ -547,13 +547,28 @@ def fit_ballistic(
         A :class:`TrajectoryEstimate` at ``METRIC`` tier on success, else ``RELATIVE``.
     """
     idx = _segment_indices(track, segment)
-    centers = track.centers()[idx]
-    times_all = track.times()
-    times = times_all[idx] - times_all[idx][0]  # time relative to segment start
-    frame_range = (int(track.frames[idx[0]]), int(track.frames[idx[-1]]))
+    seg_centers = track.centers()[idx]
+    seg_times = track.times()[idx]
 
-    if idx.size < 3:
-        # Too short to fit anything physical: honest pixel-displacement fallback.
+    # Drop non-finite observations (NaN/inf centers — a routine dirty-tracker condition)
+    # BEFORE fitting. A single non-finite value poisons the least-squares fit so that
+    # ``a_px``/residual become NaN; because every comparison against NaN is False, such a
+    # fit slips through the metric sanity gate and would emit a NaN-scale METRIC result —
+    # the cardinal §10 sin — or crash downstream. Detection masks non-finite (lines ~208,
+    # ~280); the fit path must too. We fit only the finite observations and fall back
+    # honestly if too few remain (BAL-NAN-GATE).
+    finite = np.isfinite(seg_centers).all(axis=1) & np.isfinite(seg_times)
+    kept = idx[finite]
+    centers = seg_centers[finite]
+    if kept.size:
+        times = seg_times[finite] - seg_times[finite][0]  # time relative to first kept obs
+        frame_range = (int(track.frames[kept[0]]), int(track.frames[kept[-1]]))
+    else:
+        times = np.zeros(0, dtype=np.float64)
+        frame_range = (int(segment.start_frame), int(segment.end_frame))
+
+    if centers.shape[0] < 3:
+        # Too short (or too few finite points) to fit anything physical: honest fallback.
         return _relative_fallback(centers, times, frame_range, segment, reason="too_few_points")
 
     # Robustly fit BOTH image axes (RANSAC arc selection + IRLS refinement). The emitted
@@ -565,7 +580,7 @@ def fit_ballistic(
     xfit = irls_quadratic(times, centers[:, 0], rng=rng)
 
     a_px = yfit.accel
-    n_seg = idx.size
+    n_seg = centers.shape[0]
     inlier_count = int(np.count_nonzero(yfit.inlier_mask > 0.5))
     inlier_fraction = inlier_count / float(n_seg)
     vertical_extent = float(np.ptp(centers[:, 1])) or 1.0
@@ -607,6 +622,14 @@ def fit_ballistic(
         )
 
     scale = ctx.gravity / a_px  # meters per pixel; a_px > 0 guaranteed by the signed gate
+    if not (np.isfinite(scale) and scale > 0.0):
+        # Defense in depth: the gate guarantees a finite a_px >= floor, so this should be
+        # unreachable, but a non-finite scale must never reach _build_metric_estimate.
+        return _relative_fallback(
+            centers, times, frame_range, segment, reason="non_finite_scale",
+            a_px=a_px, residual_fraction=residual_fraction, inlier_fraction=inlier_fraction,
+            xfit=xfit, yfit=yfit,
+        )
     sanity_factor = float(np.clip(sanity_margin, 0.0, 1.0))
     confidence = combine_confidence(residual_factor, inlier_factor, completeness, sanity_factor)
     gof = _goodness_of_fit(
@@ -651,6 +674,12 @@ def _passes_sanity_gate(
     Returns ``(passes, sanity_margin)`` where ``sanity_margin`` in ``[0, 1]`` summarizes
     how comfortably the residual and inlier conditions are met (used as a confidence cue).
     """
+    # Fail CLOSED on non-finite inputs. A NaN/inf ``a_px`` or residual (from a fit poisoned
+    # by a bad observation) compares False against every threshold below, so without this
+    # guard the gate would PASS and ``g / a_px`` would emit a NaN-scale METRIC result
+    # (BAL-NAN-GATE). A fit that cannot be evaluated has not earned metric scale.
+    if not (np.isfinite(a_px) and np.isfinite(residual_fraction) and np.isfinite(inlier_fraction)):
+        return False, 0.0
     # SIGNED check: must accelerate downward (image-y increases) AND appreciably. Using
     # abs() here would promote upward-accelerating (anti-gravity) arcs to METRIC — the
     # cardinal §10 sin of earning scale from a motion that is not gravitational free fall.
@@ -882,6 +911,11 @@ def _relative_fallback(
         velocity_rel = np.zeros((times.shape[0], 3), dtype=np.float64)
         velocity_rel[:, 0] = (xfit.c1 + 2.0 * xfit.c2 * times) / extent
         velocity_rel[:, 1] = (yfit.c1 + 2.0 * yfit.c2 * times) / extent
+    elif centers.shape[0] == 0:
+        # No finite observations at all (e.g. an all-NaN segment): an empty, zero-confidence
+        # RELATIVE estimate rather than a crash.
+        positions_rel = np.zeros((0, 3), dtype=np.float64)
+        velocity_rel = np.zeros((0, 3), dtype=np.float64)
     else:
         disp_px = centers - centers[0]
         extent = float(np.linalg.norm(np.ptp(centers, axis=0))) or 1.0

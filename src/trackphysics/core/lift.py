@@ -120,12 +120,20 @@ def _smoothness(positions: FloatArray) -> float:
     energy in smooth motion and little in second-difference noise, so the score is near 1;
     a jittery one drops toward 0. Returns 1.0 for series too short to have curvature.
     """
-    if positions.shape[0] < 3:
-        return 1.0
-    d1 = np.diff(positions, axis=0)
-    d2 = np.diff(positions, n=2, axis=0)
+    # Compute over finite rows only: a single non-finite coordinate (a dirty-tracker
+    # NaN/inf bbox) would otherwise make motion/jitter NaN and propagate a NaN
+    # goodness_of_fit that crashes TrajectoryEstimate's [0, 1] check (LIFT-NAN). Excluding
+    # the bad rows degrades gracefully instead.
+    finite = np.isfinite(positions).all(axis=1)
+    pos = positions[finite]
+    if pos.shape[0] < 3:
+        return 0.0 if finite.sum() < positions.shape[0] else 1.0
+    d1 = np.diff(pos, axis=0)
+    d2 = np.diff(pos, n=2, axis=0)
     motion = float(np.sum(d1 * d1))
     jitter = float(np.sum(d2 * d2))
+    if not (np.isfinite(motion) and np.isfinite(jitter)):
+        return 0.0
     if motion <= _EPS:
         # No motion at all: a static, perfectly coherent (if uninformative) track.
         return 1.0
@@ -214,13 +222,20 @@ def relative_lift(track: TrackSequence) -> TrajectoryEstimate:
     if n >= 2 and np.all(np.diff(times) > 0):
         vel = np.asarray(np.gradient(pos, times, axis=0), dtype=np.float64)
         vel_source = "finite_difference"
+        vel_degenerate = False
     else:
         vel = np.zeros_like(pos)
         vel_source = "finite_difference_degenerate"
+        vel_degenerate = True
 
     density = _observation_density(track)
     smoothness = _smoothness(pos)
     confidence = combine_confidence(density, smoothness)
+    # The degenerate branch returns a FABRICATED all-zeros velocity (no derivable motion:
+    # <2 samples or non-increasing/duplicate times). It must NOT inherit the position
+    # confidence — the velocity was not measured, so report it at zero confidence
+    # (LIFT-DEGEN-VEL).
+    vel_confidence = 0.0 if vel_degenerate else confidence
 
     segment = Segment(
         start_frame=int(frames[0]),
@@ -241,7 +256,7 @@ def relative_lift(track: TrackSequence) -> TrajectoryEstimate:
         value=vel,
         unit=None,
         tier=Tier.RELATIVE,
-        confidence=confidence,
+        confidence=vel_confidence,
         source=vel_source,
         frame=frame_span,
     )
