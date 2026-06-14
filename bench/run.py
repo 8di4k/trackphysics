@@ -60,17 +60,32 @@ def make_arc(
     )
 
 
-def make_pitched_arc(rng: np.random.Generator) -> tuple[tp.TrackSequence, GroundTruth]:
-    """A clean ballistic arc viewed by a PITCHED (downward-looking) camera.
+def _truth_at_segment_start(est: tp.TrajectoryEstimate, gt: GroundTruth) -> float | None:
+    """True speed at the frame the engine reports its speed for (the segment start).
 
-    The gravity-as-a-ruler premise (world-vertical maps to image-y, near-constant depth) is
-    violated, so any recovered METRIC scale is biased — a "metric-untrustworthy" case. The
-    engine cannot detect this monocularly in v0.1, so it is a genuine HARD NEGATIVE for the
-    gate (BENCH-03): it exposes a real failure surface rather than a trivially-separable one.
+    The engine's launch speed is the speed at the START of the detected free-flight segment,
+    which on a decelerating arc is a later frame than launch. Comparing it against the true
+    speed at frame 0 is a reference-instant error; compare at the segment-start frame instead.
+    """
+    frame = est.velocity.frame
+    if not isinstance(frame, tuple):
+        return None
+    matches = np.where(gt.frames.astype(np.int64) == int(frame[0]))[0]
+    return float(gt.speed[int(matches[0])]) if matches.size else None
+
+
+def make_steep_arc(rng: np.random.Generator) -> tuple[tp.TrackSequence, GroundTruth]:
+    """A clean ballistic arc viewed by a STEEPLY pitched (downward-looking) camera.
+
+    This grossly violates gravity-as-a-ruler (world-vertical no longer maps to image-y, depth
+    changes strongly along the arc), so the recovered METRIC scale is badly biased (~tens of
+    percent at the segment-start instant) — a genuine "metric-untrustworthy" HARD NEGATIVE for
+    the gate. A *mild* tilt, by contrast, the engine tolerates (~few percent), so it would NOT
+    be a fair hard negative; the steep geometry is the real failure surface (BENCH-03).
     """
     vx = float(rng.uniform(4.0, 8.0))
     vz = float(rng.uniform(5.0, 9.0))
-    cam = look_at_camera(eye=(3.0, -6.0, 4.5), target=(3.0, 0.0, 1.0))
+    cam = look_at_camera(eye=(3.0, -4.0, 7.0), target=(3.0, 0.0, 0.5))
     return generate_track(
         cam, fps=120.0, launch_velocity=(vx, 0.0, vz), drag_coeff=0.2, duration=1.2
     )
@@ -176,19 +191,20 @@ def run_gate(*, n_runs: int = 120, base_seed: int = 50) -> dict[str, float]:
     Positive (metric trustworthy) = clean ballistic arc, horizontal camera, scale earnable.
     Negative (should refuse / untrustworthy) =
       * trivial: near-constant-velocity motion, or a too-short track; AND
-      * HARD (BENCH-03): a clean parabola viewed by a PITCHED camera, where the
-        gravity-as-a-ruler premise is violated so any recovered scale is biased. v0.1
+      * HARD (BENCH-03): a clean parabola viewed by a STEEPLY pitched camera, where
+        gravity-as-a-ruler is grossly violated so the recovered scale is badly biased. v0.1
         cannot detect this monocularly, so these surface as false positives — the gate is
-        deliberately NOT trivially separable.
+        deliberately NOT trivially separable. (A *mild* tilt the engine tolerates, so it
+        would be an unfair hard negative; the steep geometry is the real failure surface.)
 
-    Also reports the pitched-camera false-positive rate and mean relative speed bias so the
-    limitation is quantified, not hidden.
+    Bias is measured at the engine's segment-start instant. Also reports the steep-camera
+    false-positive rate and mean relative speed bias so the limitation is quantified.
     """
     predicted_metric: list[float] = []
     scale_recoverable: list[float] = []
-    pitched_total = 0
-    pitched_metric = 0
-    pitched_bias: list[float] = []
+    steep_total = 0
+    steep_metric = 0
+    steep_bias: list[float] = []
     for i in range(n_runs):
         rng = np.random.default_rng(base_seed + i)
         kind = i % 4
@@ -202,22 +218,23 @@ def run_gate(*, n_runs: int = 120, base_seed: int = 50) -> dict[str, float]:
             scale_recoverable.append(0.0)
             est = tp.analyze(track, preset="sphere", grounding=tp.GroundingContext()).trajectory
             predicted_metric.append(1.0 if est.tier == tp.Tier.METRIC else 0.0)
-        else:  # HARD negative: pitched camera -> metric is biased / untrustworthy
-            track, gt = make_pitched_arc(rng)
+        else:  # HARD negative: STEEP camera -> metric is badly biased / untrustworthy
+            track, gt = make_steep_arc(rng)
             scale_recoverable.append(0.0)
             est = tp.analyze(track, preset="sphere", grounding=tp.GroundingContext()).trajectory
             is_metric = est.tier == tp.Tier.METRIC
             predicted_metric.append(1.0 if is_metric else 0.0)
-            pitched_total += 1
+            steep_total += 1
             if is_metric:
-                pitched_metric += 1
-                speed = float(np.linalg.norm(np.asarray(est.velocity.value)[0]))
-                pitched_bias.append(abs(speed - float(gt.speed[0])) / float(gt.speed[0]))
+                steep_metric += 1
+                # Bias at the segment-start instant the engine actually reports (not frame 0).
+                truth = _truth_at_segment_start(est, gt)
+                speed = float(est.meta["launch_speed_m_s"])  # type: ignore[arg-type]
+                if truth:
+                    steep_bias.append(abs(speed - truth) / truth)
     gate = gate_precision_recall(np.array(predicted_metric), np.array(scale_recoverable))
-    gate["pitched_false_positive_rate"] = (
-        pitched_metric / pitched_total if pitched_total else 0.0
-    )
-    gate["pitched_mean_rel_bias"] = float(np.mean(pitched_bias)) if pitched_bias else float("nan")
+    gate["steep_false_positive_rate"] = steep_metric / steep_total if steep_total else 0.0
+    gate["steep_mean_rel_bias"] = float(np.mean(steep_bias)) if steep_bias else float("nan")
     return gate
 
 
@@ -237,13 +254,16 @@ def run_calibration(
     for i in range(n_runs):
         rng = np.random.default_rng(base_seed + i)
         track, gt = make_arc(rng)
-        true_speed = float(gt.speed[0])
         sigma = jitter_levels[i % len(jitter_levels)]
         dirty = corrupt(track, CorruptionConfig(jitter_sigma_px=sigma, jitter_rho=0.6), rng)
         est = tp.analyze(dirty, preset="sphere", grounding=tp.GroundingContext()).trajectory
         if est.tier != tp.Tier.METRIC:
             continue
-        speed = float(np.linalg.norm(np.asarray(est.velocity.value)[0]))
+        # Compare at the segment-start instant the engine reports (not frame 0).
+        true_speed = _truth_at_segment_start(est, gt)
+        if true_speed is None:
+            continue
+        speed = float(est.meta["launch_speed_m_s"])  # type: ignore[arg-type]
         confidences.append(float(est.velocity.confidence))
         correct.append(1.0 if abs(speed - true_speed) / true_speed < CORRECT_REL_TOL else 0.0)
         if sigma == 0.0:
@@ -386,8 +406,8 @@ def _render_markdown(
     ece: float,
     real: dict[str, object] | None,
 ) -> str:
-    pitched_fp = gate.get("pitched_false_positive_rate", float("nan"))
-    pitched_bias = gate.get("pitched_mean_rel_bias", float("nan"))
+    steep_fp = gate.get("steep_false_positive_rate", float("nan"))
+    steep_bias = gate.get("steep_mean_rel_bias", float("nan"))
     lines = [
         "# trackphysics v0.1 — benchmark report (synthetic)",
         "",
@@ -437,15 +457,16 @@ def _render_markdown(
         "## Metric-vs-fallback gate",
         "",
         "Positive = emits METRIC; ground truth positive = scale genuinely trustworthy. The",
-        "negatives include a HARD case — a clean parabola from a PITCHED camera, where the",
-        "gravity-as-a-ruler premise is violated (not trivially separable).",
+        "negatives include a HARD case — a clean parabola from a STEEPLY pitched camera, where",
+        "gravity-as-a-ruler is grossly violated (not trivially separable). Speed bias is measured",
+        "at the engine's segment-start instant (the frame it reports), not frame 0.",
         "",
         f"- precision **{gate['precision']:.2f}**, recall **{gate['recall']:.2f}**, "
         f"F1 **{gate['f1']:.2f}**, accuracy **{gate['accuracy']:.2f}**",
         "- confusion: "
         f"tp={gate['tp']:.0f} fp={gate['fp']:.0f} fn={gate['fn']:.0f} tn={gate['tn']:.0f}",
-        f"- **known limitation:** on pitched-camera arcs the engine still emits METRIC "
-        f"{pitched_fp * 100:.0f}% of the time with a mean speed bias of {pitched_bias * 100:.0f}% "
+        f"- **known limitation:** on steeply-pitched arcs the engine still emits METRIC "
+        f"{steep_fp * 100:.0f}% of the time with a mean speed bias of {steep_bias * 100:.0f}% "
         "— it cannot detect the violated assumption monocularly (a v0.2 cross-check item).",
         "",
         "![degradation: false positives](degradation_false_positives.png)",

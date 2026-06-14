@@ -56,6 +56,56 @@ def test_reference_scale_yields_metric_even_without_arc() -> None:
     assert tp.Tier.METRIC in tiers
 
 
+def _truth_at_segment_start(est: tp.TrajectoryEstimate, gt: object) -> float:
+    """True speed at the engine's reported (segment-start) frame — the consistent instant."""
+    frame = est.velocity.frame
+    assert isinstance(frame, tuple)
+    frames = np.asarray(gt.frames, dtype=np.int64)  # type: ignore[attr-defined]
+    idx = int(np.where(frames == int(frame[0]))[0][0])
+    return float(np.asarray(gt.speed)[idx])  # type: ignore[attr-defined]
+
+
+def test_cooperative_camera_ci_covers_truth() -> None:
+    # Level camera, realistic drag: the engine's CI (measurement + v0.1 systematic floor)
+    # COVERS the true speed at the instant it reports -> the harness's calibrated-PASS case.
+    cam = look_at_camera(eye=(3.0, -7.0, 1.5), target=(3.0, 0.0, 1.7))
+    track, gt = generate_track(
+        cam, fps=120.0, launch_velocity=(6.0, 0.0, 7.0), drag_coeff=0.2, duration=1.2
+    )
+    est = tp.analyze(track, preset="sphere", grounding=tp.GroundingContext()).trajectory
+    assert est.tier == tp.Tier.METRIC
+    true_speed = _truth_at_segment_start(est, gt)  # compared at the SAME frame
+    lo, hi = est.meta["launch_speed_ci95"]  # type: ignore[misc]
+    assert lo <= true_speed <= hi
+
+
+def test_steep_camera_ci_is_overconfident() -> None:
+    # A STEEPLY pitched camera grossly violates gravity-as-a-ruler yet still fits a clean
+    # parabola: the engine emits METRIC with a tight CI that does NOT cover the true speed at
+    # the reported instant -> the genuine overconfident-FAIL case (a mild tilt, by contrast,
+    # the engine tolerates and would correctly PASS).
+    cam = look_at_camera(eye=(3.0, -4.0, 7.0), target=(3.0, 0.0, 0.5))
+    track, gt = generate_track(
+        cam, fps=120.0, launch_velocity=(6.0, 0.0, 7.0), drag_coeff=0.2, duration=1.2
+    )
+    est = tp.analyze(track, preset="sphere", grounding=tp.GroundingContext()).trajectory
+    assert est.tier == tp.Tier.METRIC
+    true_speed = _truth_at_segment_start(est, gt)
+    lo, hi = est.meta["launch_speed_ci95"]  # type: ignore[misc]
+    assert not (lo <= true_speed <= hi)  # overconfident: tight CI misses the true speed
+
+
+def test_relative_fallback_has_no_metric_ci() -> None:
+    cam = look_at_camera(eye=(3.0, -7.0, 1.5), target=(3.0, 0.0, 1.7))
+    track, _gt = generate_track(
+        cam, fps=120.0, launch_velocity=(5.0, 4.0, 0.2), gravity=1e-6, drag_coeff=1e-9,
+        duration=0.8,
+    )
+    est = tp.analyze(track, preset="sphere", grounding=tp.GroundingContext()).trajectory
+    assert est.tier != tp.Tier.METRIC
+    assert est.meta.get("launch_speed_ci95") is None  # no metric claim -> no CI
+
+
 def test_generic_path_has_relative_floor_and_quality() -> None:
     track, _ = _clean_arc()
     res = tp.analyze(track)  # no preset

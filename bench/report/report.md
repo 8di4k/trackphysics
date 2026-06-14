@@ -7,7 +7,7 @@ simulated, camera-projected ballistic arc; corruption is correlated (not IID).
 
 ## Clean metric accuracy
 
-Mean launch-speed error on uncorrupted arcs (**realistic drag = 0.2**, a genuine model mismatch for the v0.1 pure-quadratic fit): **0.281 m/s**.
+Mean launch-speed error on uncorrupted arcs (**realistic drag = 0.2**, a genuine model mismatch for the v0.1 pure-quadratic fit): **0.148 m/s**.
 
 ## Graceful degradation (the moat)
 
@@ -45,12 +45,13 @@ Expected Calibration Error (ECE) of stated confidence vs empirical correctness: 
 ## Metric-vs-fallback gate
 
 Positive = emits METRIC; ground truth positive = scale genuinely trustworthy. The
-negatives include a HARD case — a clean parabola from a PITCHED camera, where the
-gravity-as-a-ruler premise is violated (not trivially separable).
+negatives include a HARD case — a clean parabola from a STEEPLY pitched camera, where
+gravity-as-a-ruler is grossly violated (not trivially separable). Speed bias is measured
+at the engine's segment-start instant (the frame it reports), not frame 0.
 
 - precision **0.67**, recall **1.00**, F1 **0.80**, accuracy **0.75**
 - confusion: tp=60 fp=30 fn=0 tn=30
-- **known limitation:** on pitched-camera arcs the engine still emits METRIC 100% of the time with a mean speed bias of 21% — it cannot detect the violated assumption monocularly (a v0.2 cross-check item).
+- **known limitation:** on steeply-pitched arcs the engine still emits METRIC 100% of the time with a mean speed bias of 49% — it cannot detect the violated assumption monocularly (a v0.2 cross-check item).
 
 ![degradation: false positives](degradation_false_positives.png)
 ![degradation: jitter](degradation_jitter.png)

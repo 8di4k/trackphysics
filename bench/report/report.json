@@ -1,5 +1,5 @@
 {
-  "clean_launch_speed_error_m_s": 0.2807730776925183,
+  "clean_launch_speed_error_m_s": 0.14775481633268092,
   "headline_arc_drag_coeff": 0.2,
   "degradation_false_positives": {
     "levels": [
@@ -118,8 +118,8 @@
     "fp": 30.0,
     "fn": 0.0,
     "tn": 30.0,
-    "pitched_false_positive_rate": 1.0,
-    "pitched_mean_rel_bias": 0.20704141586814495
+    "steep_false_positive_rate": 1.0,
+    "steep_mean_rel_bias": 0.4902545726312951
   },
   "real_data": null
 }

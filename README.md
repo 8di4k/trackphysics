@@ -102,10 +102,11 @@ Run `python -m bench.run` to regenerate the full report (numbers + plots) under
 [`bench/report/`](bench/report/). On synthetic data with exact metric ground truth (a
 physics-simulated, camera-projected ballistic arc) under **correlated** (not IID) corruption:
 
-- **Clean metric accuracy.** Mean launch-speed error ≈ **0.28 m/s** (~2%) — measured on arcs
-  with **realistic aerodynamic drag** (coefficient 0.2), a genuine model mismatch for the
-  v0.1 pure-quadratic fit. (On drag-free arcs it is ~0.04 m/s, but that would be grading the
-  estimator on its own simplifying assumption, so the headline uses the harder, honest case.)
+- **Clean metric accuracy.** Mean speed error ≈ **0.15 m/s** (~1.5%) — measured on arcs with
+  **realistic aerodynamic drag** (coefficient 0.2), a genuine model mismatch for the v0.1
+  pure-quadratic fit, and compared at the engine's reported instant (the detected segment
+  start). (On drag-free arcs it is ~0.04 m/s, but that would be grading the estimator on its
+  own simplifying assumption, so the headline uses the harder, honest case.)
 - **Graceful degradation (the moat).** Mean |launch-speed error| under a rising
   false-positive/outlier rate, on **drag-free** arcs so the fitting-robustness effect is
   isolated (drag is a separate axis). Both methods use identical gravity-as-a-ruler; only the
@@ -126,10 +127,11 @@ physics-simulated, camera-projected ballistic arc) under **correlated** (not IID
   correctness ≈ **0.06** — stated confidence ≈ actual correctness.
 - **Metric-vs-fallback gate.** Positive = emits METRIC; positives are clean recoverable arcs,
   negatives include trivially-unrecoverable tracks **and a hard case** (a clean parabola from
-  a *pitched* camera, where gravity-as-a-ruler is violated): **precision ≈ 0.67, recall 1.00,
-  F1 ≈ 0.80**. It never fabricates metric on trivially-unrecoverable input, but it *cannot*
-  detect the pitched-camera assumption violation monocularly in v0.1 — there it still emits a
-  biased metric (~21% speed bias). That limitation is measured and published, not hidden.
+  a *steeply pitched* camera, where gravity-as-a-ruler is grossly violated): **precision ≈
+  0.67, recall 1.00, F1 ≈ 0.80**. It never fabricates metric on trivially-unrecoverable input,
+  but it *cannot* detect the steep-camera assumption violation monocularly in v0.1 — there it
+  still emits a biased metric (~49% speed bias at the reported instant). A *mild* tilt, by
+  contrast, it tolerates (~few %). That limitation is measured and published, not hidden.
 
 Real-data validation loaders (LATTE-MV, then an automotive set) are scaffolded in
 [`bench/datasets.py`](bench/datasets.py); they expect locally-prepared data and do not
@@ -139,9 +141,10 @@ otherwise the report prints an explicit **synthetic-only / sim2real-unmeasured**
 > **Known characteristics (v0.1).** Gravity-as-a-ruler assumes a static, roughly-horizontal
 > camera with near-constant depth over a short arc, and fits a pure ballistic parabola
 > (aerodynamic drag is a clean future extension). Two honest consequences, both measured in
-> the report: (1) a **pitched/oblique camera** breaks the world-vertical↔image-y mapping and
-> yields a biased metric estimate the engine can't yet detect monocularly (a v0.2 cross-check
-> / stereo item); (2) scale recovery is **SNR-limited** — at high fps the per-frame curvature
+> the report: (1) a **steeply pitched/oblique camera** breaks the world-vertical↔image-y
+> mapping and yields a biased metric estimate the engine can't yet detect monocularly (a v0.2
+> cross-check / stereo item); a *mild* tilt is tolerated (~few %). (2) scale recovery is
+> **SNR-limited** — at high fps the per-frame curvature
 > signal can fall below positional jitter, and the engine then honestly falls back rather
 > than guess. Single-arc gravity-as-a-ruler *assumes* g; it does not independently recover
 > and cross-check it (also v0.2).

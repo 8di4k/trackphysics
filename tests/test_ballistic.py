@@ -162,6 +162,21 @@ def test_fit_recovers_metric_scale_and_speed() -> None:
     assert 0.0 < est.positions.confidence <= 1.0
 
 
+def test_metric_meta_carries_launch_speed_and_ci() -> None:
+    track, true_speed = _parabola_track(n=30)
+    seg = _full_segment(track)
+    est = fit_ballistic(track, seg, GroundingContext(gravity=G), rng=np.random.default_rng(0))
+    assert est.tier is Tier.METRIC
+    speed = float(est.meta["launch_speed_m_s"])  # type: ignore[arg-type]
+    ci = est.meta["launch_speed_ci95"]
+    assert ci is not None
+    lo, hi = ci  # type: ignore[misc]
+    assert lo <= speed <= hi  # the point estimate lies within its own CI
+    assert np.isfinite(lo) and np.isfinite(hi)
+    # On a clean, exact parabola the recovered launch speed matches truth closely.
+    assert abs(speed - true_speed) / true_speed < 0.05
+
+
 def test_fit_metric_high_confidence_on_clean_arc() -> None:
     track, _ = _parabola_track(n=30)
     seg = _full_segment(track)

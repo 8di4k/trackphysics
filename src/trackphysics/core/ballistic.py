@@ -83,6 +83,18 @@ _RESIDUAL_FRACTION_TOL = 0.05
 _MIN_INLIER_FRACTION = 0.6
 """Fraction of segment points that must survive RANSAC+IRLS for a trusted fit."""
 
+_SYSTEMATIC_REL_FLOOR = 0.08
+"""Relative systematic-uncertainty floor on the recovered launch speed.
+
+The fit-covariance CI captures *measurement* noise only. v0.1 also carries a *model*
+discrepancy the fit cannot see: a pure-quadratic (drag-free) model and the
+gravity-as-a-ruler assumptions (static, ~horizontal camera, near-constant depth). The
+benchmark's model-mismatch curve puts realistic-drag error at a few percent, so the engine
+must NOT claim sub-percent precision. This floor makes the emitted CI an honest *total*
+uncertainty: cooperative conditions (modest drag) stay covered, while a gross
+assumption violation (e.g. a pitched camera) exceeds it and is correctly flagged as
+overconfident. Tightening this is a v0.2 item (drag-augmented fit, stereo)."""
+
 
 @dataclass
 class QuadraticFit:
@@ -709,6 +721,88 @@ def _fitted_positions_velocity(
     return positions, velocity
 
 
+def _coeff_cov(
+    times: FloatArray, inlier_mask: FloatArray, rms_residual: float
+) -> FloatArray | None:
+    """Covariance of the quadratic coefficients ``[c0, c1, c2]`` over the inlier set.
+
+    Standard OLS result ``Cov = sigma^2 (A^T A)^-1`` with ``A`` the Vandermonde design over
+    inlier times and ``sigma^2`` the dof-corrected residual variance. Returns ``None`` when
+    there are too few inliers or the normal matrix is singular (then no CI is emitted).
+    """
+    mask = inlier_mask > 0.5
+    t = times[mask]
+    n = int(t.shape[0])
+    if n <= 3:
+        return None
+    design = np.column_stack([np.ones(n), t, t * t])
+    try:
+        ata_inv = np.linalg.inv(design.T @ design)
+    except np.linalg.LinAlgError:
+        return None
+    sigma2 = (rms_residual**2) * n / max(n - 3, 1)  # dof correction
+    return np.asarray(sigma2 * ata_inv, dtype=np.float64)
+
+
+def _launch_speed_and_ci(
+    xfit: QuadraticFit,
+    yfit: QuadraticFit,
+    times: FloatArray,
+    scale: float,
+    *,
+    scale_from_gravity: bool,
+) -> tuple[float, tuple[float, float] | None]:
+    """Launch speed (m/s) at the segment start and its 95% confidence interval.
+
+    The CI is parametric error propagation (delta method) of the fit-coefficient covariance
+    through ``scale`` and the planar speed ``s = scale * hypot(vx0, vy0)``. It reflects
+    fit / measurement uncertainty only — it does NOT know about systematic bias from a
+    violated assumption (e.g. a pitched camera), which is exactly why a coverage test
+    against an independent ground truth is meaningful (an overconfident, biased estimate
+    yields a tight CI that fails to cover the truth).
+    """
+    vx0, vy0 = float(xfit.c1), float(yfit.c1)
+    s_px = float(np.hypot(vx0, vy0))
+    speed = float(scale * s_px)
+    systematic_half = _SYSTEMATIC_REL_FLOOR * abs(speed)
+
+    def _floor_only() -> tuple[float, tuple[float, float] | None]:
+        # The systematic floor is always defensible (depends only on speed). Emit it even
+        # when the measurement covariance is unavailable, so a METRIC speed never ships with
+        # NO band at all — that would understate uncertainty, not overstate it (CI-02).
+        return speed, (speed - systematic_half, speed + systematic_half)
+
+    if s_px < 1e-9:
+        return speed, None  # direction/speed genuinely undefined
+    cov_x = _coeff_cov(times, xfit.inlier_mask, xfit.rms_residual)
+    cov_y = _coeff_cov(times, yfit.inlier_mask, yfit.rms_residual)
+    if cov_x is None or cov_y is None:
+        return _floor_only()
+
+    var = (scale * vx0 / s_px) ** 2 * float(cov_x[1, 1])  # contribution from vx0
+    if scale_from_gravity:
+        c2y = float(yfit.c2)
+        if abs(c2y) < 1e-12:
+            return _floor_only()
+        # speed depends on the y-fit's (c1, c2): vy0 = c1, and scale = g / (2 c2). Include
+        # their covariance (delta method): d speed/d c1y, d speed/d c2y.
+        d_c1y = scale * vy0 / s_px
+        d_c2y = -s_px * scale / c2y
+        grad = np.array([d_c1y, d_c2y], dtype=np.float64)
+        var += float(grad @ cov_y[1:3, 1:3] @ grad)
+    else:
+        # Supplied scale is treated as exact; only vy0 carries uncertainty.
+        var += (scale * vy0 / s_px) ** 2 * float(cov_y[1, 1])
+
+    if not np.isfinite(var) or var < 0.0:
+        return _floor_only()
+    # Total half-width: measurement (1.96 sigma) combined with the v0.1 systematic floor
+    # (in quadrature), so the CI is an honest TOTAL uncertainty, not fit-noise only.
+    measurement_half = 1.96 * float(np.sqrt(var))
+    half = float(np.hypot(measurement_half, systematic_half))
+    return speed, (speed - half, speed + half)
+
+
 def _build_metric_estimate(
     xfit: QuadraticFit,
     yfit: QuadraticFit,
@@ -729,6 +823,13 @@ def _build_metric_estimate(
     note_meta = dict(meta)
     note_meta["depth_axis"] = "unknown_at_monocular_tier_set_to_zero"
     note_meta["trajectory_source"] = "robust_fit"
+    # Launch speed + 95% CI (parametric, from the fit). A consumer/validator reads these
+    # directly; the CI lets a coverage test catch overconfident (biased) metric output.
+    launch_speed, ci95 = _launch_speed_and_ci(
+        xfit, yfit, times, scale, scale_from_gravity=(source != "reference_scale")
+    )
+    note_meta["launch_speed_m_s"] = launch_speed
+    note_meta["launch_speed_ci95"] = ci95
 
     positions_q = Quantity(
         value=positions_m, unit="m", tier=Tier.METRIC,
