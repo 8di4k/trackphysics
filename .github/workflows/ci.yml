@@ -27,10 +27,13 @@ jobs:
           python -m pip install -e ".[dev,bench]"
 
       - name: Lint (ruff)
-        run: python -m ruff check src bench tests examples
+        run: python -m ruff check src bench tests examples validation
 
       - name: Type check (mypy --strict on the package)
         run: python -m mypy
+
+      - name: Type check (mypy --strict on bench + validation)
+        run: python -m mypy bench validation
 
       - name: Tests (incl. the domain-agnostic guardrail)
         run: python -m pytest -q
