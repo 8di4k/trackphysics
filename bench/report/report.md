@@ -7,7 +7,7 @@ simulated, camera-projected ballistic arc; corruption is correlated (not IID).
 
 ## Clean metric accuracy
 
-Mean launch-speed error on uncorrupted arcs (**realistic drag = 0.2**, a genuine model mismatch for the v0.1 pure-quadratic fit): **0.148 m/s**.
+Mean launch-speed error on uncorrupted arcs (**realistic drag = 0.2**, a genuine model mismatch for the v0.1 pure-quadratic fit): **0.135 m/s**.
 
 ## Graceful degradation (the moat)
 
@@ -48,7 +48,9 @@ robust     0.01   0.11   0.29   0.58   1.09
 
 ## Provenance calibration
 
-Expected Calibration Error (ECE) of stated confidence vs empirical correctness: **0.063**.
+Expected Calibration Error (ECE) of stated confidence vs empirical correctness: **0.014** over **239** scored METRIC emissions (**1/8** confidence bins populated).
+
+> **Known v0.1 limitation (not a validated full-range calibration).** The confidence model is effectively near-binary: any arc clean enough to earn METRIC scores ~1.0, and no METRIC-emitting corruption (drag, gap bursts) pushes it into a low-confidence regime — the detector simply re-finds a clean sub-arc. So the scored emissions concentrate in the top bin: the ECE shows the engine is reliable *where it is confident* (high confidence ⇒ empirically correct), but it does NOT yet exercise a calibrated low-confidence range. A more discriminative confidence model is a v0.2 item; until then read this as a reliability *floor*, not a full-range calibration curve (1 of 8 bins populated).
 
 ## Metric-vs-fallback gate
 
