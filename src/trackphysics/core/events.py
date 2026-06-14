@@ -82,49 +82,73 @@ def _finite_difference(values: FloatArray, times: FloatArray) -> FloatArray:
     return deriv
 
 
-def _vertical_velocity_series(est: TrajectoryEstimate, track: TrackSequence) -> FloatArray:
-    """Extract the vertical-velocity series implied by an estimate.
+@dataclass
+class _VertSeries:
+    """A vertical-velocity series plus the metadata a detector needs to label and locate
+    events HONESTLY.
+
+    ``tier``/``unit`` describe the *values* (e.g. ``PIXEL``/``"px/s"`` when the series was
+    derived from raw pixel centers, regardless of the estimate's own tier — otherwise a
+    pixel-rate number would be mislabelled metric, EVENTS-TIER-LEAK). ``track_space`` records
+    the index space: ``True`` means index ``i`` is a direct track-detection index (the
+    last-resort centers branch); ``False`` means ``i`` aligns with the estimate's own arrays
+    (so it must be mapped through the segment, EVENTS-FRAME-MISLOC).
+    """
+
+    values: FloatArray
+    tier: Tier
+    unit: str | None
+    track_space: bool
+
+
+def _vertical_velocity_series(est: TrajectoryEstimate, track: TrackSequence) -> _VertSeries:
+    """Extract the vertical-velocity series implied by an estimate, with provenance.
 
     Prefers the estimate's own ``velocity`` array. A 2-D ``(T, D)`` velocity uses column
     ``_VERTICAL_AXIS`` (= 1) as the vertical axis — correct for both the engine's ``(T, 3)``
     ``[x, y, depth]`` lifts and its ``(T, 2)`` ``[x, y]`` pixel velocities (see the
-    module-level layout convention). A ``(T,)`` scalar series cannot expose a signed
-    vertical component, so we fall back to differencing the vertical position. If neither is
-    array-valued, we difference the track's pixel centers as a last resort.
+    module-level layout convention). A ``(T,)`` scalar series cannot expose a signed vertical
+    component, so we fall back to differencing the vertical position. If neither is
+    array-valued, we difference the track's pixel centers as a last resort — that series is
+    pixel-rate and lives in full-track index space, so it is tagged ``PIXEL`` and
+    ``track_space=True`` rather than inheriting the estimate's (possibly metric) tier.
     """
     vel = est.velocity.value
     if isinstance(vel, np.ndarray) and vel.ndim == 2 and vel.shape[1] > _VERTICAL_AXIS:
-        return _column(vel, _VERTICAL_AXIS)
+        return _VertSeries(_column(vel, _VERTICAL_AXIS), est.tier, _velocity_unit(est), False)
 
     pos = est.positions.value
-    times = _estimate_times(est, track)
     if isinstance(pos, np.ndarray) and pos.ndim == 2 and pos.shape[1] > _VERTICAL_AXIS:
         vertical_pos = _column(pos, _VERTICAL_AXIS)
-        return _finite_difference(vertical_pos, times)
+        times = _estimate_times(est, track, vertical_pos.shape[0])
+        return _VertSeries(
+            _finite_difference(vertical_pos, times), est.tier, _velocity_unit(est), False
+        )
 
-    # Last resort: difference the track's pixel-y centers over the segment window.
+    # Last resort: difference the track's pixel-y centers. Values are pixel-rate in
+    # FULL-TRACK index space -> PIXEL tier/unit and track_space=True (never the estimate's
+    # metric tier/unit, which would fabricate a metric velocity, EVENTS-TIER-LEAK).
     centers = track.centers()
     if centers.shape[0] >= 2:
-        return _finite_difference(_column(centers, 1), track.times())
-    return np.zeros(0, dtype=np.float64)
+        diff = _finite_difference(_column(centers, 1), track.times())
+        return _VertSeries(diff, Tier.PIXEL, "px/s", True)
+    return _VertSeries(np.zeros(0, dtype=np.float64), Tier.PIXEL, "px/s", True)
 
 
-def _estimate_times(est: TrajectoryEstimate, track: TrackSequence) -> FloatArray:
-    """Per-sample times aligned with an estimate's position/velocity arrays.
+def _estimate_times(est: TrajectoryEstimate, track: TrackSequence, n: int) -> FloatArray:
+    """Per-sample times of length exactly ``n``, aligned with the array being differenced.
 
-    Uses the segment's materialized ``indices`` into the track when available; otherwise
-    falls back to the full track timeline truncated/padded to the array length.
+    Uses the segment's materialized ``indices`` only when their count matches ``n`` (so a
+    mismatched/externally-built estimate cannot return a wrong-length timeline that would
+    index past the end of the value array, EVENTS-VSERIES-LEN). Otherwise falls back to the
+    full track timeline truncated, or a synthesized uniform timeline, to length ``n``.
     """
     track_times = track.times()
     seg = est.segment
-    if seg is not None and seg.indices is not None and seg.indices.size > 0:
+    if seg is not None and seg.indices is not None and seg.indices.size == n and n > 0:
         idx = seg.indices
         if int(idx.max()) < track_times.shape[0]:
             return track_times[idx]
-    arr = est.velocity.value
-    if not (isinstance(arr, np.ndarray) and arr.ndim >= 1):
-        arr = est.positions.value
-    n = arr.shape[0] if isinstance(arr, np.ndarray) and arr.ndim >= 1 else track_times.shape[0]
     if track_times.shape[0] >= n:
         return track_times[:n]
     # Synthesize a uniform timeline if the track is shorter than the estimate arrays.
@@ -133,7 +157,7 @@ def _estimate_times(est: TrajectoryEstimate, track: TrackSequence) -> FloatArray
 
 
 def _frame_for_index(est: TrajectoryEstimate, track: TrackSequence, index: int) -> int:
-    """Map a position into the estimate's arrays back to an absolute frame index."""
+    """Map an ESTIMATE-array index back to an absolute frame index (via the segment)."""
     seg = est.segment
     if seg is not None and seg.indices is not None and 0 <= index < seg.indices.size:
         frames = track.frames
@@ -146,6 +170,21 @@ def _frame_for_index(est: TrajectoryEstimate, track: TrackSequence, index: int) 
     if seg is not None:
         return int(seg.start_frame + index)
     return int(index)
+
+
+def _frame_at(
+    est: TrajectoryEstimate, track: TrackSequence, index: int, *, track_space: bool
+) -> int:
+    """Map a series index to a frame, honouring the series' index space.
+
+    ``track_space`` series indices are direct track-detection indices (do NOT remap through
+    the segment, which would mislocate the event); estimate-space indices use
+    :func:`_frame_for_index`.
+    """
+    if track_space:
+        frames = track.frames
+        return int(frames[index]) if 0 <= index < frames.shape[0] else int(index)
+    return _frame_for_index(est, track, index)
 
 
 # --------------------------------------------------------------------------------------
@@ -213,10 +252,10 @@ class BounceDetector:
 
     def detect(self, est: TrajectoryEstimate, track: TrackSequence) -> list[Event]:
         """Return generic bounce/impact events for one trajectory estimate."""
-        v_raw = _vertical_velocity_series(est, track)
-        if v_raw.shape[0] < 3:
+        vs = _vertical_velocity_series(est, track)
+        if vs.values.shape[0] < 3:
             return []
-        v = _smooth(v_raw, self.smoothing_window)
+        v = _smooth(vs.values, self.smoothing_window)
 
         # Robust vertical-speed scale (median absolute value), used for the jitter gate
         # and for normalizing reversal sharpness into a confidence factor.
@@ -227,13 +266,15 @@ class BounceDetector:
             return []
         min_speed = self.min_speed_fraction * scale
 
-        unit = _velocity_unit(est)
-        tier = est.tier
+        # Tier/unit and index space come from the SERIES, not the estimate: a pixel-derived
+        # fallback series must be labelled PIXEL/px-s and located in track space.
+        unit = vs.unit
+        tier = vs.tier
         events: list[Event] = []
         for i in _bounce_indices(v, min_speed=min_speed):
             pre = float(v[i - 1])
             post = float(v[i])
-            frame = _frame_for_index(est, track, i)
+            frame = _frame_at(est, track, i, track_space=vs.track_space)
             confidence = self._confidence(pre, post, scale, est.goodness_of_fit)
             events.append(
                 Event(
@@ -497,11 +538,18 @@ class ReleaseDetector:
     """Best-effort: detect the onset of a free-flight segment (BRIEF.md §12.3).
 
     "Release" is the kinematic transition from non-free-flight motion into free flight —
-    the first sample at which the vertical motion begins to follow constant downward
-    acceleration (gravity). This is deliberately simple and clearly best-effort: we scan
-    the vertical-velocity series for the start of a sustained, near-linear ramp (constant
-    acceleration) and report its onset frame. It never claims metric tier; it only marks
-    *where* free flight appears to begin.
+    the first sample at which the vertical motion begins to follow *constant acceleration*
+    (the kinematic signature of free flight). This is deliberately simple and clearly
+    best-effort: we scan the vertical-velocity series for the start of a sustained,
+    near-linear ramp (constant acceleration) and report its onset frame. It never claims
+    metric tier; it only marks *where* free flight appears to begin.
+
+    Like :class:`BounceDetector`, this is a *generic, sign-agnostic* kinematic test: it
+    keys off acceleration *constancy*, NOT a gravity-direction or magnitude check (the core
+    has no oriented gravity axis — that is a grounding/domain concern, §6). So a sustained
+    constant acceleration of either sign qualifies; a domain layer that knows which way is
+    down can post-filter the onset against its own gravity. The reported acceleration sign
+    is in the payload so a consumer can apply that check itself.
 
     The detector keys off the estimate's own segment when that segment is already labeled
     a free-flight (``"ballistic"``) window — then release is simply that window's onset.
@@ -535,15 +583,15 @@ class ReleaseDetector:
                 )
             ]
 
-        v = _vertical_velocity_series(est, track)
-        if v.shape[0] < self.min_run + 1:
+        vs = _vertical_velocity_series(est, track)
+        if vs.values.shape[0] < self.min_run + 1:
             return []
-        times = _estimate_times(est, track)
-        accel = _finite_difference(_smooth(v, 3), times)
+        times = _estimate_times(est, track, vs.values.shape[0])
+        accel = _finite_difference(_smooth(vs.values, 3), times)
         onset = self._first_constant_accel_run(accel)
         if onset is None:
             return []
-        frame = _frame_for_index(est, track, onset)
+        frame = _frame_at(est, track, onset, track_space=vs.track_space)
         confidence = self._confidence(accel, onset, est.goodness_of_fit)
         return [
             Event(
@@ -554,8 +602,8 @@ class ReleaseDetector:
                     "onset": "constant_acceleration",
                     "acceleration": Quantity(
                         value=float(np.median(accel[onset : onset + self.min_run])),
-                        unit=_acceleration_unit(est),
-                        tier=est.tier,
+                        unit=_acceleration_unit_for_tier(vs.tier),
+                        tier=vs.tier,
                         confidence=confidence,
                         source="finite_difference",
                         frame=frame,
@@ -601,9 +649,10 @@ def _velocity_unit(est: TrajectoryEstimate) -> str | None:
     return {Tier.METRIC: "m/s", Tier.RELATIVE: None, Tier.PIXEL: "px/s"}[est.tier]
 
 
-def _acceleration_unit(est: TrajectoryEstimate) -> str | None:
-    """Acceleration unit string matching an estimate's tier."""
-    return {Tier.METRIC: "m/s^2", Tier.RELATIVE: None, Tier.PIXEL: "px/s^2"}[est.tier]
+def _acceleration_unit_for_tier(tier: Tier) -> str | None:
+    """Acceleration unit string for a given tier (the payload tier may differ from the
+    estimate's when the series was derived from pixel centers — keep them consistent)."""
+    return {Tier.METRIC: "m/s^2", Tier.RELATIVE: None, Tier.PIXEL: "px/s^2"}[tier]
 
 
 __all__ = ["BounceDetector", "ReleaseDetector", "detect_contacts"]

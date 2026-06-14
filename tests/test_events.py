@@ -405,6 +405,67 @@ def test_release_fires_on_engine_3d_layout() -> None:
 
 
 # --------------------------------------------------------------------------------------
+# (f) Index-space / tier provenance of the vertical-velocity series
+#     Regression guards for EVENTS-VSERIES-LEN (crash), EVENTS-FRAME-MISLOC (wrong frame),
+#     and EVENTS-TIER-LEAK (pixel-derived value mislabelled metric).
+# --------------------------------------------------------------------------------------
+
+
+def test_bounce_no_crash_on_position_longer_than_segment() -> None:
+    # Scalar velocity forces the position-differencing branch; a (T,2) position spanning the
+    # full track while the segment lists fewer indices must not index times past the end.
+    ys = [100.0, 82.0, 66.0, 52.0, 40.0, 38.0, 48.0, 62.0, 78.0, 96.0]
+    track = _track_from_centers(np.stack([np.zeros(10), np.array(ys)], axis=1))
+    seg = Segment(
+        start_frame=2, end_frame=7, kind="ballistic", indices=np.array([2, 3, 4, 5, 6, 7])
+    )
+    est = TrajectoryEstimate(
+        positions=Quantity(
+            np.stack([np.zeros(10), np.array(ys)], axis=1), unit="px", tier=Tier.PIXEL,
+            confidence=0.5, source="t",
+        ),
+        velocity=Quantity(np.arange(5.0), unit="px/s", tier=Tier.PIXEL, confidence=0.5, source="t"),
+        tier=Tier.PIXEL,
+        goodness_of_fit=0.8,
+        segment=seg,
+    )
+    events = BounceDetector().detect(est, track)  # must not raise IndexError
+    assert isinstance(events, list)
+
+
+def test_bounce_pixel_fallback_keeps_pixel_tier_and_track_frame() -> None:
+    # Scalar velocity + 1-D position on a METRIC estimate forces the last-resort centers
+    # branch. That value is pixel-derived in full-track index space, so the payload must be
+    # PIXEL/px-s (never the estimate's m/s METRIC) and the frame must be the true full-track
+    # location of the reversal (~105), not a segment-remapped frame.
+    ys = [100.0, 82.0, 66.0, 52.0, 40.0, 38.0, 48.0, 62.0, 78.0, 96.0]
+    dets = [
+        Detection(frame=100 + f, bbox=_bbox(0.0, ys[f]), track_id=1) for f in range(10)
+    ]
+    track = TrackSequence(detections=dets, fps=10.0, image_size=(1000, 1000))
+    seg = Segment(
+        start_frame=102, end_frame=107, kind="ballistic", indices=np.array([2, 3, 4, 5, 6, 7])
+    )
+    est = TrajectoryEstimate(
+        positions=Quantity(
+            np.arange(1.0, 11.0), unit="m", tier=Tier.METRIC, confidence=0.5, source="t"
+        ),
+        velocity=Quantity(
+            np.arange(5.0, 15.0), unit="m/s", tier=Tier.METRIC, confidence=0.5, source="t"
+        ),
+        tier=Tier.METRIC,
+        goodness_of_fit=0.8,
+        segment=seg,
+    )
+    events = BounceDetector().detect(est, track)
+    assert events, "the pixel-y reversal should still be detected"
+    ev = events[0]
+    assert ev.frame == 105  # full-track location, not segment-remapped (would be 107)
+    pre = _quantity(ev.payload, "pre_velocity")
+    assert pre.tier is Tier.PIXEL and pre.unit == "px/s"  # not fabricated METRIC m/s
+
+
+# --------------------------------------------------------------------------------------
 # Protocol conformance: detectors satisfy the EventDetector contract
 # --------------------------------------------------------------------------------------
 
