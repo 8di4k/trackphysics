@@ -194,3 +194,42 @@ def test_from_supervision_clean_confidence_roundtrips() -> None:
     scores = [d.score for d in seqs[0].detections]
     assert scores == pytest.approx([0.9, 0.95])
     assert not any(s is None or math.isnan(s) for s in scores)
+
+
+@dataclass
+class _DetsUntracked:
+    xyxy: np.ndarray
+    tracker_id: None = None
+
+
+def test_from_supervision_skips_empty_untracked_frame() -> None:
+    # A detector emits an empty frame (no detections, tracker_id None) before/without
+    # tracking; it must be SKIPPED, not abort the whole conversion (the docstring promises
+    # untracked frames are skipped).
+    empty = _DetsUntracked(xyxy=np.zeros((0, 4)))
+    tracked = _DetsConf(
+        xyxy=np.array([[0.0, 0.0, 5.0, 5.0]]), tracker_id=np.array([1]), confidence=np.array([0.9])
+    )
+    seqs = tp.from_supervision([empty, tracked], fps=30.0)
+    assert len(seqs) == 1
+    assert seqs[0].detections[0].track_id == 1
+
+
+def test_from_supervision_nonempty_untracked_frame_still_raises() -> None:
+    # But a frame WITH detections and no tracker_id is a real error (tracking not run).
+    bad = _DetsUntracked(xyxy=np.array([[0.0, 0.0, 5.0, 5.0]]))
+    with pytest.raises(ValueError, match="tracker_id"):
+        tp.from_supervision([bad], fps=30.0)
+
+
+def test_from_generic_rejects_mismatched_optional_length() -> None:
+    with pytest.raises(ValueError, match="scores must have length 3"):
+        tp.from_generic(
+            frames=[0, 1, 2], boxes=np.zeros((3, 4)), track_ids=[1, 1, 1], fps=30.0,
+            scores=[0.9, 0.8],
+        )
+    with pytest.raises(ValueError, match="keypoints must have length 3"):
+        tp.from_generic(
+            frames=[0, 1, 2], boxes=np.zeros((3, 4)), track_ids=[1, 1, 1], fps=30.0,
+            keypoints=np.zeros((2, 4, 2)),
+        )

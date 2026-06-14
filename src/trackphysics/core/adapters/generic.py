@@ -97,6 +97,14 @@ def from_generic(
     kp_arr = None if keypoints is None else np.asarray(keypoints, dtype=np.float64)
     ts_arr = None if timestamps is None else np.asarray(timestamps, dtype=np.float64)
 
+    # Validate optional column lengths against N so a dropped/extra row fails loudly with a
+    # named argument, rather than silently truncating (too long) or raising a bare IndexError
+    # deep in the comprehension (too short).
+    for name, arr in (("scores", score_arr), ("class_ids", class_arr), ("keypoints", kp_arr),
+                      ("timestamps", ts_arr)):
+        if arr is not None and arr.shape[0] != n:
+            raise ValueError(f"{name} must have length {n}, got {arr.shape[0]}")
+
     rows_by_id: dict[int, list[int]] = defaultdict(list)
     for i in range(n):
         rows_by_id[int(id_arr[i])].append(i)

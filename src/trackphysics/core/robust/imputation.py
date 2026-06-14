@@ -159,6 +159,14 @@ def impute_gaps(
         )
 
     f_int = np.rint(f).astype(np.int64)
+    if n_obs >= 2 and bool(np.any(np.diff(f_int) <= 0)):
+        # Non-increasing/duplicate frames (after rounding) would let numpy fancy assignment
+        # silently keep only the last colliding write, discarding observations without a
+        # trace. The documented contract is ascending frames; fail loudly instead.
+        raise ValueError(
+            "impute_gaps requires strictly increasing frame indices; got non-increasing or "
+            "duplicate frames after rounding"
+        )
     dim = y2d.shape[1]
     full_frames = np.arange(int(f_int[0]), int(f_int[-1]) + 1, dtype=np.int64)
     n_full = full_frames.shape[0]

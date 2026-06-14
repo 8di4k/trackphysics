@@ -64,6 +64,8 @@ def from_supervision(
         xyxy = np.asarray(dets.xyxy, dtype=np.float64)
         tracker_id = getattr(dets, "tracker_id", None)
         if tracker_id is None:
+            if xyxy.shape[0] == 0:
+                continue  # empty/untracked-empty frame: skip it, per the docstring
             raise ValueError(
                 "supervision Detections lack tracker_id; run a tracker (e.g. ByteTrack) first"
             )

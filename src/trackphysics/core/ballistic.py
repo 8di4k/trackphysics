@@ -722,6 +722,12 @@ def _finite_difference_velocity(positions: FloatArray, times: FloatArray) -> Flo
     """Per-axis velocity via numpy gradient on possibly non-uniform time samples."""
     if positions.shape[0] < 2:
         return np.zeros_like(positions)
+    if bool(np.any(np.diff(times) <= 0)):
+        # Non-increasing times (duplicate/decreasing frames) would make np.gradient divide
+        # by a zero dt and emit inf/nan velocity. Degrade to zeros, mirroring lift.py's guard
+        # (the schema now rejects duplicate frames, so this is defence in depth for direct
+        # callers of fit_ballistic).
+        return np.zeros_like(positions)
     vel = np.empty_like(positions)
     for axis in range(positions.shape[1]):
         vel[:, axis] = np.gradient(positions[:, axis], times, edge_order=1)

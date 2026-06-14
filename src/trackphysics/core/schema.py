@@ -52,11 +52,15 @@ class Detection:
     interprets it (BRIEF.md §6, hook 1)."""
 
     def __post_init__(self) -> None:
-        self.bbox = np.asarray(self.bbox, dtype=np.float64)
+        # np.array (not np.asarray) so the Detection OWNS its bbox: asarray returns the same
+        # object for an already-float64 input, which would alias the caller's array (and the
+        # adapter's shared buffer), letting in-place smoothing/imputation corrupt the input
+        # or vice-versa (SCHEMA-ALIASING, BRIEF.md §4 isolation).
+        self.bbox = np.array(self.bbox, dtype=np.float64)
         if self.bbox.shape != (4,):
             raise ValueError(f"bbox must have shape (4,), got {self.bbox.shape}")
         if self.keypoints is not None:
-            kp = np.asarray(self.keypoints, dtype=np.float64)
+            kp = np.array(self.keypoints, dtype=np.float64)  # copy: own it (see bbox note)
             if kp.ndim != 2 or kp.shape[1] not in (2, 3):
                 raise ValueError(
                     f"keypoints must have shape (K, 2) or (K, 3), got {kp.shape}"
@@ -111,7 +115,7 @@ class TrackSequence:
 
     def __post_init__(self) -> None:
         if self.timestamps is not None:
-            self.timestamps = np.asarray(self.timestamps, dtype=np.float64)
+            self.timestamps = np.array(self.timestamps, dtype=np.float64)  # own it (copy)
             if self.timestamps.ndim != 1:
                 raise ValueError(
                     f"timestamps must be 1-D, got shape {self.timestamps.shape}"
@@ -122,14 +126,18 @@ class TrackSequence:
                     f"count {len(self.detections)}"
                 )
         if len(self.detections) >= 2:
-            # The documented contract is "ordered by frame". Enforce it at the boundary so
-            # out-of-order input fails loudly here rather than silently producing degenerate
-            # (zero) velocity and bogus gap flags deep in the pipeline. Adapters sort for you.
+            # The contract is "ordered by STRICTLY INCREASING frame": one object occupies
+            # each frame at most once. Enforcing it at the boundary stops out-of-order OR
+            # DUPLICATE frames from silently producing degenerate velocity (duplicate frames
+            # -> dt=0 -> divide-by-zero inf/nan velocity) and bogus gap flags deep in the
+            # pipeline. Adapters sort for you; collapse duplicates upstream if a tracker
+            # double-reports an object in one frame (SCHEMA-DUP-FRAMES).
             frames = np.array([d.frame for d in self.detections], dtype=np.int64)
-            if bool(np.any(np.diff(frames) < 0)):
+            if bool(np.any(np.diff(frames) <= 0)):
                 raise ValueError(
-                    "detections must be ordered by non-decreasing frame; got out-of-order "
-                    "frames (use an adapter such as from_generic, which sorts, or sort first)"
+                    "detections must be ordered by strictly increasing frame; got "
+                    "out-of-order or duplicate frames (use an adapter such as from_generic, "
+                    "which sorts, or sort/de-duplicate first)"
                 )
 
     def __len__(self) -> int:
@@ -147,7 +155,7 @@ class TrackSequence:
         indices and ``fps`` (so non-contiguous frames keep correct spacing).
         """
         if self.timestamps is not None:
-            return self.timestamps
+            return self.timestamps.copy()  # pure value accessor: never hand out the internal ref
         if self.fps <= 0:
             raise ValueError("fps must be positive when timestamps are absent")
         return self.frames.astype(np.float64) / self.fps
