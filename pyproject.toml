@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trackphysics"
+version = "0.1.0.dev0"
+description = "Object-agnostic physics layer for computer-vision tracks: 3D motion, events, and kinematics with provenance."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+authors = [{ name = "trackphysics contributors" }]
+keywords = ["computer-vision", "physics", "tracking", "trajectory", "kinematics"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+# Core stays light: physics + geometry + estimation only. No deep-learning dep.
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+]
+
+[project.optional-dependencies]
+# Thin, swappable adapter — not part of the core dependency graph.
+supervision = ["supervision>=0.18"]
+# Benchmark / synthetic harness — research substrate, not shipped in core.
+bench = ["matplotlib>=3.7"]
+# Developer tooling: lint, type, test.
+dev = ["mypy>=1.8", "ruff>=0.4", "pytest>=8.0"]
+
+[project.urls]
+Homepage = "https://github.com/8di4k/trackphysics"
+Repository = "https://github.com/8di4k/trackphysics"
+Issues = "https://github.com/8di4k/trackphysics/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+trackphysics = ["py.typed"]
+
+# ---------------------------------------------------------------------------
+# Typing: `mypy --strict` is a hard gate on the installable package (BRIEF.md §15).
+# ---------------------------------------------------------------------------
+[tool.mypy]
+strict = true
+explicit_package_bases = true
+mypy_path = "src"
+files = ["src/trackphysics"]
+warn_unused_configs = true
+
+# Optional / heavy third-party deps lack complete type stubs. The CORE never
+# imports these; only optional adapters / the bench do. Don't let missing stubs
+# block the strict gate on core.
+[[tool.mypy.overrides]]
+module = ["scipy.*", "supervision.*", "filterpy.*", "matplotlib.*", "pybullet.*"]
+ignore_missing_imports = true
+
+# ---------------------------------------------------------------------------
+# Lint
+# ---------------------------------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "bench", "tests", "examples"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["B008"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

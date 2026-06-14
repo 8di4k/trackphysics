@@ -1,0 +1,6 @@
+include LICENSE
+include NOTICE
+include README.md
+include CONTRIBUTING.md
+include CLA.md
+include src/trackphysics/py.typed

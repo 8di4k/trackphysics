@@ -1,0 +1,827 @@
+"""Free-flight ("ballistic") segment detection + gravity-as-a-ruler physics fit.
+
+This module implements the heart of the v0.1 metric story (BRIEF.md §7, §10, §12.2):
+
+1. :func:`detect_ballistic_segments` finds windows of a pixel track whose *motion
+   signature* is consistent with constant-acceleration projectile motion — roughly
+   constant vertical (image-``y``) acceleration and near-zero horizontal acceleration.
+
+2. :func:`fit_ballistic` fits ``y_px(t) = y0 + vy0*t + 0.5*a_px*t^2`` over a segment with
+   a RANSAC hypothesis search followed by IRLS (iteratively reweighted least squares)
+   refinement, then recovers metric scale by **gravity-as-a-ruler**: under a static,
+   roughly-horizontal camera with near-constant depth over the short arc, the world
+   vertical axis maps to image-``y`` and a known gravitational acceleration ``g`` (m/s^2)
+   pins the meters-per-pixel scale to ``s = g / |a_px|`` (px/s^2 -> m/px).
+
+The provenance rules of BRIEF.md §10 are enforced strictly:
+
+* Metric tier is emitted **only** when scale is genuinely earned — either a supplied
+  ``reference_scale`` (or a derived scale from a ``reference_plane``), or a
+  gravity-as-a-ruler fit that passes a physical-sanity gate (downward acceleration of
+  plausible magnitude, low fit residual, enough inliers).
+* When scale is not earned, the fit falls back **honestly** to a scale-free
+  :data:`~trackphysics.core.provenance.Tier.RELATIVE` estimate (positions normalized to
+  start, velocity in normalized units). It never fabricates metric.
+
+Depth (the out-of-plane axis) is unknown at this monocular v0.1 tier; the third position
+component is set to ``0`` with a ``meta`` note. Full 3D depth is a v0.2 / stereo concern.
+
+Honest scope of the gate (BRIEF.md §10): single-arc gravity-as-a-ruler *assumes* ``g``
+(``s = g / a_px``), so it cannot independently *recover* and cross-check ``g`` from one
+arc. The gate verifies the motion is gravity-consistent (downward sign, plausible
+magnitude, low residual, enough inliers) — not a recovered-``g`` tolerance. An independent
+recovered-``g`` / cross-arc scale-consistency check is a v0.2 (multi-arc / stereo) item.
+
+Only numpy + the trackphysics contract types are used (BRIEF.md §15). ``scipy`` is not
+required here: the quadratic fit is a 3-parameter linear least-squares problem solved with
+``numpy.linalg.lstsq``, which keeps the dependency surface minimal and Jetson-friendly.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+import numpy as np
+import numpy.typing as npt
+
+from .grounding import GroundingContext
+from .provenance import Quantity, Tier, TrajectoryEstimate, combine_confidence
+from .schema import FloatArray, Segment, TrackSequence
+
+BoolArray = npt.NDArray[np.bool_]
+"""Alias for a boolean ndarray (inlier masks)."""
+
+__all__ = [
+    "QuadraticFit",
+    "detect_ballistic_segments",
+    "fit_ballistic",
+    "irls_quadratic",
+    "ransac_quadratic",
+]
+
+# --------------------------------------------------------------------------------------
+# Tunables. Conservative defaults; the benchmark (BRIEF.md §14) calibrates these.
+# --------------------------------------------------------------------------------------
+
+_MIN_SEGMENT_POINTS = 7
+"""Minimum observations for a credible quadratic fit (3 params + margin)."""
+
+_SMOOTH_WINDOW = 5
+"""Odd window length for the moving-average pre-smoother used in detection."""
+
+# Physical-sanity bounds on the recovered vertical pixel acceleration. Real free flight
+# has a clearly non-zero downward acceleration; anything near zero is linear motion and
+# must NOT be promoted to metric (that is the honest-fallback path).
+_MIN_ABS_PIXEL_ACCEL = 1.0
+"""px/s^2: below this, vertical accel is indistinguishable from linear motion."""
+
+# Fit-residual tolerance, expressed relative to the segment's vertical pixel extent. A
+# good parabola hugs its observations; a large normalized residual fails the gate.
+_RESIDUAL_FRACTION_TOL = 0.05
+"""RMS residual / vertical extent above which the metric gate fails."""
+
+_MIN_INLIER_FRACTION = 0.6
+"""Fraction of segment points that must survive RANSAC+IRLS for a trusted fit."""
+
+
+@dataclass
+class QuadraticFit:
+    """Result of fitting ``y(t) = c0 + c1*t + c2*t^2`` with robust inlier selection.
+
+    All quantities are in the *input* units of the fit (pixels and seconds when fed pixel
+    centers and times). ``accel`` is ``2 * c2`` (the second derivative).
+    """
+
+    c0: float
+    c1: float
+    c2: float
+    accel: float
+    """Second time-derivative ``d^2 y / d t^2`` = ``2 * c2`` (px/s^2 for pixel input)."""
+
+    inlier_mask: FloatArray
+    """Boolean-as-float mask (1.0 inlier / 0.0 outlier), shape ``(N,)``."""
+
+    rms_residual: float
+    """Root-mean-square fit residual over the inliers, in input units (e.g. px)."""
+
+    def predict(self, t: FloatArray) -> FloatArray:
+        """Evaluate the fitted quadratic at times ``t``."""
+        return self.c0 + self.c1 * t + self.c2 * t * t
+
+
+def _moving_average(x: FloatArray, window: int) -> FloatArray:
+    """Centered moving average with edge clamping; returns an array of the same length.
+
+    Used only as a *detection* pre-smoother to tame jitter before differentiating. The
+    physics fit itself operates on the raw observations (smoothing biases derivatives).
+    """
+    n = x.shape[0]
+    if window <= 1 or n < window:
+        return x.astype(np.float64, copy=True)
+    if window % 2 == 0:
+        window += 1
+    half = window // 2
+    padded = np.pad(x, (half, half), mode="edge")
+    kernel = np.ones(window, dtype=np.float64) / float(window)
+    return np.convolve(padded, kernel, mode="valid")
+
+
+def _second_difference(values: FloatArray, times: FloatArray) -> FloatArray:
+    """Local second derivative via three-point finite differences on possibly uneven t.
+
+    Returns an array of length ``len(values) - 2`` aligned with the interior points.
+    """
+    n = values.shape[0]
+    if n < 3:
+        return np.empty(0, dtype=np.float64)
+    out = np.empty(n - 2, dtype=np.float64)
+    for k in range(1, n - 1):
+        t_prev, t_curr, t_next = times[k - 1], times[k], times[k + 1]
+        h1 = t_curr - t_prev
+        h2 = t_next - t_curr
+        denom = 0.5 * (h1 + h2) * h1 * h2
+        if denom <= 0.0:
+            out[k - 1] = np.nan
+            continue
+        # Non-uniform three-point second derivative.
+        out[k - 1] = (
+            h2 * values[k - 1] - (h1 + h2) * values[k] + h1 * values[k + 1]
+        ) / denom
+    return out
+
+
+def detect_ballistic_segments(
+    track: TrackSequence,
+    *,
+    min_points: int = _MIN_SEGMENT_POINTS,
+    accel_consistency_tol: float = 0.45,
+    horizontal_accel_fraction: float = 0.5,
+) -> list[Segment]:
+    """Find free-flight segments by motion signature (BRIEF.md §12.2).
+
+    A free-flight run is a contiguous window where the vertical (image-``y``)
+    acceleration is approximately *constant* (consistent with constant-acceleration
+    projectile motion) and the horizontal (image-``x``) acceleration is *near zero*
+    relative to the vertical one. Detection smooths the pixel centers, estimates the
+    per-point vertical and horizontal accelerations by finite differences, and grows the
+    longest window satisfying both conditions.
+
+    Args:
+        track: The input track. Short tracks (fewer than ``min_points`` detections after
+            interior trimming) yield ``[]``.
+        min_points: Minimum observations for a returned segment.
+        accel_consistency_tol: Allowed spread of the vertical acceleration, as a fraction
+            of its median magnitude, for the window to count as "constant accel".
+        horizontal_accel_fraction: Max ratio of median ``|a_x|`` to median ``|a_y|`` for
+            the window to count as "horizontal accel near zero".
+
+    Returns:
+        A list of ``Segment(kind="ballistic", indices=...)`` covering the detected runs,
+        ordered by start index. Empty if no qualifying window exists.
+    """
+    n = len(track)
+    if n < max(min_points, 3):
+        return []
+
+    centers = track.centers()
+    times = track.times()
+    xs = _moving_average(centers[:, 0], _SMOOTH_WINDOW)
+    ys = _moving_average(centers[:, 1], _SMOOTH_WINDOW)
+
+    ay = _second_difference(ys, times)  # length n-2, aligned to interior indices 1..n-2
+    ax = _second_difference(xs, times)
+    if ay.size == 0:
+        return []
+
+    valid = np.isfinite(ay) & np.isfinite(ax)
+    abs_ay = np.abs(ay)
+    abs_ax = np.abs(ax)
+
+    # Per-interior-point boolean: vertical accel is appreciable, DOWNWARD (gravity-
+    # consistent: image-y increases), and dominates horizontal. The signed `ay >= floor`
+    # (not abs) keeps anti-gravity runs from ever being proposed as ballistic, consistent
+    # with the signed metric gate.
+    median_ay = float(np.median(abs_ay[valid])) if np.any(valid) else 0.0
+    accel_floor = max(_MIN_ABS_PIXEL_ACCEL, 0.25 * median_ay)
+    point_ok = valid & (ay >= accel_floor) & (abs_ax <= horizontal_accel_fraction * abs_ay)
+
+    segments: list[Segment] = []
+    interior_start = 1  # interior point k corresponds to detection index k
+
+    run_start: int | None = None
+    for k in range(point_ok.size):
+        if point_ok[k]:
+            if run_start is None:
+                run_start = k
+        else:
+            if run_start is not None:
+                seg = _finalize_run(
+                    track,
+                    times,
+                    ys,
+                    run_start + interior_start,
+                    k - 1 + interior_start,
+                    ay[run_start : k],
+                    min_points,
+                    accel_consistency_tol,
+                )
+                if seg is not None:
+                    segments.append(seg)
+                run_start = None
+    if run_start is not None:
+        seg = _finalize_run(
+            track,
+            times,
+            ys,
+            run_start + interior_start,
+            point_ok.size - 1 + interior_start,
+            ay[run_start:],
+            min_points,
+            accel_consistency_tol,
+        )
+        if seg is not None:
+            segments.append(seg)
+
+    return segments
+
+
+def _finalize_run(
+    track: TrackSequence,
+    times: FloatArray,
+    ys: FloatArray,
+    lo_idx: int,
+    hi_idx: int,
+    run_accels: FloatArray,
+    min_points: int,
+    accel_consistency_tol: float,
+) -> Segment | None:
+    """Validate one candidate run and, if it qualifies, build a Segment.
+
+    Expands the interior run by one point on each side (interior accel indices exclude the
+    window endpoints) so the returned segment includes the full observed arc.
+    """
+    start = max(0, lo_idx - 1)
+    end = min(len(track) - 1, hi_idx + 1)
+    if end - start + 1 < min_points:
+        return None
+
+    finite = run_accels[np.isfinite(run_accels)]
+    if finite.size == 0:
+        return None
+    median = float(np.median(np.abs(finite)))
+    if median < _MIN_ABS_PIXEL_ACCEL:
+        return None
+    spread = float(np.std(finite))
+    if median > 0 and spread / median > accel_consistency_tol:
+        return None
+
+    frames = track.frames
+    indices = np.arange(start, end + 1, dtype=np.int64)
+    return Segment(
+        start_frame=int(frames[start]),
+        end_frame=int(frames[end]),
+        kind="ballistic",
+        indices=indices,
+        source_track=track,  # stateless fit: the segment carries its own track
+    )
+
+
+def ransac_quadratic(
+    t: FloatArray,
+    y: FloatArray,
+    *,
+    n_iters: int = 200,
+    residual_tol: float | None = None,
+    min_inliers: int | None = None,
+    rng: np.random.Generator | None = None,
+) -> QuadraticFit:
+    """RANSAC hypothesis search for ``y(t) = c0 + c1*t + c2*t^2``.
+
+    Repeatedly samples 3 points (the minimal set for a quadratic), fits the exact
+    quadratic, and counts inliers within ``residual_tol``. The hypothesis with the most
+    inliers wins; a final least-squares re-fit over those inliers produces the returned
+    coefficients. This isolates a clean free-flight arc from sparse false positives /
+    outliers before IRLS refines it (BRIEF.md §11).
+
+    Args:
+        t: Sample times, shape ``(N,)``.
+        y: Observations, shape ``(N,)``.
+        n_iters: Number of random minimal-sample hypotheses.
+        residual_tol: Inlier threshold on ``|y - y_hat|``. Defaults to a robust estimate
+            (``2 * MAD`` of residuals from an initial all-points fit, floored at 1.0).
+        min_inliers: Minimum inliers for a hypothesis to be considered. Defaults to
+            ``max(3, ceil(0.5 * N))``.
+        rng: Optional numpy ``Generator`` for deterministic sampling.
+
+    Returns:
+        A :class:`QuadraticFit` over the best inlier set.
+    """
+    t = np.asarray(t, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n = t.shape[0]
+    if n < 3:
+        raise ValueError("ransac_quadratic needs at least 3 points")
+    if rng is None:
+        rng = np.random.default_rng(0)
+
+    base = _lstsq_quadratic(t, y)
+    base_resid = np.abs(y - base.predict(t))
+    if residual_tol is None:
+        mad = float(np.median(np.abs(base_resid - np.median(base_resid))))
+        residual_tol = max(1.0, 2.0 * 1.4826 * mad)
+    if min_inliers is None:
+        min_inliers = max(3, int(np.ceil(0.5 * n)))
+
+    if n == 3:
+        return base
+
+    best_mask = base_resid <= residual_tol
+    best_count = int(np.count_nonzero(best_mask))
+
+    indices = np.arange(n)
+    for _ in range(n_iters):
+        sample = rng.choice(indices, size=3, replace=False)
+        ts, yss = t[sample], y[sample]
+        if np.unique(ts).size < 3:
+            continue
+        coeffs = np.polyfit(ts, yss, 2)
+        pred = np.polyval(coeffs, t)
+        resid = np.abs(y - pred)
+        mask = resid <= residual_tol
+        count = int(np.count_nonzero(mask))
+        if count > best_count:
+            best_count = count
+            best_mask = mask
+
+    if best_count < min_inliers:
+        # No clean consensus; fall back to the all-points fit so the caller still gets a
+        # usable (if lower-confidence) estimate. The gate downstream handles trust.
+        return base
+    return _lstsq_quadratic(t[best_mask], y[best_mask], full_mask=best_mask)
+
+
+def irls_quadratic(
+    t: FloatArray,
+    y: FloatArray,
+    *,
+    seed: QuadraticFit | None = None,
+    n_iters: int = 10,
+    tukey_c: float = 4.685,
+    rng: np.random.Generator | None = None,
+) -> QuadraticFit:
+    """Iteratively reweighted least-squares refinement of a quadratic fit.
+
+    Down-weights large-residual observations using Tukey's biweight, re-fitting until the
+    weights stabilize. This is the smooth complement to RANSAC's hard inlier selection:
+    RANSAC picks the arc, IRLS polishes it while suppressing residual jitter / mild
+    outliers (BRIEF.md §11).
+
+    Args:
+        t: Sample times, shape ``(N,)``.
+        y: Observations, shape ``(N,)``.
+        seed: Optional starting fit; if ``None``, RANSAC provides the seed.
+        n_iters: Maximum reweighting iterations.
+        tukey_c: Tukey biweight tuning constant (in units of robust residual scale).
+        rng: Forwarded to RANSAC when ``seed`` is ``None``.
+
+    Returns:
+        The refined :class:`QuadraticFit`; ``inlier_mask`` marks points retaining
+        non-negligible weight.
+    """
+    t = np.asarray(t, dtype=np.float64)
+    y = np.asarray(y, dtype=np.float64)
+    n = t.shape[0]
+    if n < 3:
+        raise ValueError("irls_quadratic needs at least 3 points")
+
+    fit = seed if seed is not None else ransac_quadratic(t, y, rng=rng)
+    weights = np.ones(n, dtype=np.float64)
+    design = np.vstack([np.ones(n), t, t * t]).T
+
+    for _ in range(n_iters):
+        resid = y - fit.predict(t)
+        mad = float(np.median(np.abs(resid - np.median(resid))))
+        scale = max(1e-9, 1.4826 * mad)
+        u = resid / (tukey_c * scale)
+        new_weights = np.where(np.abs(u) < 1.0, (1.0 - u * u) ** 2, 0.0)
+        if np.count_nonzero(new_weights) < 3:
+            break
+        coeffs = _weighted_lstsq(design, y, new_weights)
+        c0, c1, c2 = float(coeffs[0]), float(coeffs[1]), float(coeffs[2])
+        new_fit = _make_fit(t, y, c0, c1, c2, mask=new_weights > 1e-6)
+        if np.allclose(new_weights, weights, atol=1e-6):
+            fit, weights = new_fit, new_weights
+            break
+        fit, weights = new_fit, new_weights
+
+    return fit
+
+
+def _lstsq_quadratic(
+    t: FloatArray,
+    y: FloatArray,
+    *,
+    full_mask: BoolArray | None = None,
+) -> QuadraticFit:
+    """Unweighted least-squares quadratic fit.
+
+    Fits over the points in ``t``/``y``. ``full_mask`` is an optional boolean mask over a
+    *larger* parent array (the original N points) recording which were used as inliers; it
+    is carried through to the returned fit's ``inlier_mask`` for reporting. When omitted,
+    every supplied point is treated as an inlier.
+    """
+    design = np.vstack([np.ones_like(t), t, t * t]).T
+    coeffs, *_ = np.linalg.lstsq(design, y, rcond=None)
+    c0, c1, c2 = (float(coeffs[0]), float(coeffs[1]), float(coeffs[2]))
+    pred = c0 + c1 * t + c2 * t * t
+    resid = y - pred
+    rms = float(np.sqrt(np.mean(resid**2))) if resid.size else float("inf")
+    if full_mask is not None:
+        out_mask = np.asarray(full_mask, dtype=np.float64)
+    else:
+        out_mask = np.ones(t.shape[0], dtype=np.float64)
+    return QuadraticFit(c0=c0, c1=c1, c2=c2, accel=2.0 * c2, inlier_mask=out_mask,
+                        rms_residual=rms)
+
+
+def _weighted_lstsq(design: FloatArray, y: FloatArray, weights: FloatArray) -> FloatArray:
+    """Solve a weighted linear least-squares problem ``min sum w_i (X b - y)_i^2``."""
+    sqrt_w = np.sqrt(weights)[:, None]
+    coeffs, *_ = np.linalg.lstsq(design * sqrt_w, y * sqrt_w[:, 0], rcond=None)
+    return np.asarray(coeffs, dtype=np.float64)
+
+
+def _make_fit(
+    t: FloatArray,
+    y: FloatArray,
+    c0: float,
+    c1: float,
+    c2: float,
+    *,
+    mask: BoolArray | None = None,
+) -> QuadraticFit:
+    """Assemble a :class:`QuadraticFit`, computing RMS residual over the inliers.
+
+    ``mask`` (same length as ``t``) marks which points count as inliers for the residual
+    and for the reported ``inlier_mask``. When ``None``, all points are inliers.
+    """
+    pred = c0 + c1 * t + c2 * t * t
+    resid = y - pred
+    bool_mask = (
+        np.ones(t.shape[0], dtype=bool) if mask is None else np.asarray(mask, dtype=bool)
+    )
+    inliers = resid[bool_mask]
+    rms = float(np.sqrt(np.mean(inliers**2))) if inliers.size else float("inf")
+    return QuadraticFit(
+        c0=c0,
+        c1=c1,
+        c2=c2,
+        accel=2.0 * c2,
+        inlier_mask=bool_mask.astype(np.float64),
+        rms_residual=rms,
+    )
+
+
+def _scale_from_reference(ctx: GroundingContext) -> float | None:
+    """Return a supplied metric scale (meters-per-pixel) if the context provides one.
+
+    A ``reference_scale`` is taken directly. A ``reference_plane`` alone does not, by
+    itself, fix a pixel-to-meter scale without camera intrinsics (a v0.2 concern), so it
+    is *not* converted to a scalar scale here; the gravity-as-a-ruler path handles the
+    monocular case. If only a plane is given, this returns ``None`` and the engine relies
+    on gravity-as-a-ruler.
+    """
+    if ctx.reference_scale is not None:
+        return float(ctx.reference_scale)
+    return None
+
+
+def fit_ballistic(
+    track: TrackSequence,
+    segment: Segment,
+    ctx: GroundingContext,
+    *,
+    rng: np.random.Generator | None = None,
+) -> TrajectoryEstimate:
+    """Fit a ballistic arc and recover metric scale by gravity-as-a-ruler (BRIEF.md §10).
+
+    Pipeline:
+
+    1. Slice the segment's pixel centers and times from ``track``.
+    2. Fit ``y_px(t)`` with RANSAC (arc selection) + IRLS (robust refinement).
+    3. Determine scale:
+
+       * If ``ctx.reference_scale`` is supplied -> use it directly; tier ``METRIC``,
+         ``source="reference_scale"``.
+       * Else gravity-as-a-ruler: ``s = gravity / |a_px|`` (m/px). Emit ``METRIC`` **only**
+         if the physical-sanity gate passes (downward accel of plausible magnitude, low
+         normalized residual, enough inliers).
+       * Otherwise fall back **honestly** to a scale-free ``RELATIVE`` estimate.
+
+    4. Build position (``(T, 3)``) and velocity (``(T, 3)``) Quantities. In-plane axes use
+       ``s * (pixel displacement from the segment start)``; the depth axis is ``0`` (a v0.2
+       / stereo concern), noted in ``meta``. Velocity is differentiated from positions.
+
+    The ``confidence`` is derived from real factors via
+    :func:`~trackphysics.core.provenance.combine_confidence` — never hardcoded.
+
+    Args:
+        track: The track the segment indexes into.
+        segment: A segment (typically ``kind="ballistic"``) with materialized ``indices``.
+        ctx: Grounding context; supplies ``gravity`` and any metric reference.
+        rng: Optional generator for deterministic RANSAC.
+
+    Returns:
+        A :class:`TrajectoryEstimate` at ``METRIC`` tier on success, else ``RELATIVE``.
+    """
+    idx = _segment_indices(track, segment)
+    centers = track.centers()[idx]
+    times_all = track.times()
+    times = times_all[idx] - times_all[idx][0]  # time relative to segment start
+    frame_range = (int(track.frames[idx[0]]), int(track.frames[idx[-1]]))
+
+    if idx.size < 3:
+        # Too short to fit anything physical: honest pixel-displacement fallback.
+        return _relative_fallback(centers, times, frame_range, segment, reason="too_few_points")
+
+    # Robustly fit BOTH image axes (RANSAC arc selection + IRLS refinement). The emitted
+    # trajectory is built from THESE fits (see _build_metric_estimate), so points the
+    # robust fit down-weighted as outliers do not leak into the returned product — the
+    # robustness machinery cleans the actual output, not merely the scale/confidence
+    # (BAL-RAWPOS, BRIEF.md §11).
+    yfit = irls_quadratic(times, centers[:, 1], rng=rng)
+    xfit = irls_quadratic(times, centers[:, 0], rng=rng)
+
+    a_px = yfit.accel
+    n_seg = idx.size
+    inlier_count = int(np.count_nonzero(yfit.inlier_mask > 0.5))
+    inlier_fraction = inlier_count / float(n_seg)
+    vertical_extent = float(np.ptp(centers[:, 1])) or 1.0
+    residual_fraction = yfit.rms_residual / vertical_extent
+    # Observation density / completeness over the segment SPAN (BRIEF.md §10): the
+    # fraction of spanned frames actually observed. Distinct from inlier survival — a
+    # clean parabola with large temporal gaps must not earn maximal confidence.
+    span = frame_range[1] - frame_range[0] + 1
+    completeness = float(np.clip(n_seg / span, 0.0, 1.0)) if span > 0 else 1.0
+
+    # Sub-confidence factors (BRIEF.md §10): each in [0, 1].
+    residual_factor = float(np.clip(1.0 - residual_fraction / _RESIDUAL_FRACTION_TOL, 0.0, 1.0))
+    inlier_factor = float(np.clip(inlier_fraction, 0.0, 1.0))
+
+    supplied_scale = _scale_from_reference(ctx)
+    if supplied_scale is not None:
+        # Scale is given outright -> METRIC, with confidence/gof from FIT quality only.
+        # No gravitational sanity is evaluated on this path, so none is fabricated into the
+        # score (PROV-03).
+        confidence = combine_confidence(residual_factor, inlier_factor, completeness)
+        gof = _goodness_of_fit(residual_fraction, inlier_fraction, completeness=completeness)
+        return _build_metric_estimate(
+            xfit, yfit, times, supplied_scale, frame_range, segment,
+            source="reference_scale", confidence=confidence, gof=gof,
+            meta={"scale_m_per_px": supplied_scale, "a_px": a_px, "completeness": completeness},
+        )
+
+    # Gravity-as-a-ruler. The world-vertical maps to image-y; a_px is px/s^2 (downward +).
+    sane, sanity_margin = _passes_sanity_gate(
+        a_px=a_px,
+        residual_fraction=residual_fraction,
+        inlier_fraction=inlier_fraction,
+    )
+    if not sane:
+        return _relative_fallback(
+            centers, times, frame_range, segment, reason="sanity_gate_failed",
+            a_px=a_px, residual_fraction=residual_fraction, inlier_fraction=inlier_fraction,
+            xfit=xfit, yfit=yfit,
+        )
+
+    scale = ctx.gravity / a_px  # meters per pixel; a_px > 0 guaranteed by the signed gate
+    sanity_factor = float(np.clip(sanity_margin, 0.0, 1.0))
+    confidence = combine_confidence(residual_factor, inlier_factor, completeness, sanity_factor)
+    gof = _goodness_of_fit(
+        residual_fraction, inlier_fraction, sanity_margin=sanity_margin, completeness=completeness
+    )
+    return _build_metric_estimate(
+        xfit, yfit, times, scale, frame_range, segment,
+        source="ballistic_fit", confidence=confidence, gof=gof,
+        meta={
+            "scale_m_per_px": scale,
+            "a_px": a_px,
+            "gravity": ctx.gravity,
+            "inlier_fraction": inlier_fraction,
+            "residual_fraction": residual_fraction,
+            "completeness": completeness,
+        },
+    )
+
+
+def _segment_indices(track: TrackSequence, segment: Segment) -> FloatArray:
+    """Resolve the detection indices a segment covers (materialized or by frame range)."""
+    if segment.indices is not None:
+        return np.asarray(segment.indices, dtype=np.int64)
+    frames = track.frames
+    mask = (frames >= segment.start_frame) & (frames <= segment.end_frame)
+    return np.nonzero(mask)[0].astype(np.int64)
+
+
+def _passes_sanity_gate(
+    *, a_px: float, residual_fraction: float, inlier_fraction: float
+) -> tuple[bool, float]:
+    """Physical-sanity gate for promoting a fit to METRIC (BRIEF.md §10).
+
+    Requires (1) an appreciable vertical acceleration in the **gravity-consistent
+    direction** — under the schema's image convention (``y`` points down) free fall
+    accelerates *downward*, i.e. ``a_px`` must be positive and at least
+    ``_MIN_ABS_PIXEL_ACCEL``; an upward (negative) vertical acceleration is physically
+    anti-gravitational and is NOT free flight, so it must fall back to RELATIVE rather than
+    have ``g`` used as its ruler — (2) a low normalized fit residual, and (3) enough
+    surviving inliers.
+
+    Returns ``(passes, sanity_margin)`` where ``sanity_margin`` in ``[0, 1]`` summarizes
+    how comfortably the residual and inlier conditions are met (used as a confidence cue).
+    """
+    # SIGNED check: must accelerate downward (image-y increases) AND appreciably. Using
+    # abs() here would promote upward-accelerating (anti-gravity) arcs to METRIC — the
+    # cardinal §10 sin of earning scale from a motion that is not gravitational free fall.
+    if a_px < _MIN_ABS_PIXEL_ACCEL:
+        return False, 0.0
+    if residual_fraction > _RESIDUAL_FRACTION_TOL:
+        return False, 0.0
+    if inlier_fraction < _MIN_INLIER_FRACTION:
+        return False, 0.0
+    residual_margin = 1.0 - residual_fraction / _RESIDUAL_FRACTION_TOL
+    inlier_margin = (inlier_fraction - _MIN_INLIER_FRACTION) / (1.0 - _MIN_INLIER_FRACTION)
+    margin = float(np.clip(0.5 * (residual_margin + inlier_margin), 0.0, 1.0))
+    return True, margin
+
+
+def _goodness_of_fit(
+    residual_fraction: float,
+    inlier_fraction: float,
+    *,
+    sanity_margin: float | None = None,
+    completeness: float | None = None,
+) -> float:
+    """Average the plausibility terms ACTUALLY measured on the calling path into ``[0, 1]``.
+
+    ``residual_score`` and ``inlier_fraction`` always count. ``sanity_margin`` counts only
+    when a gravitational-sanity check was performed (the gravity-as-a-ruler path) — the
+    supplied-reference-scale path performs no such check, so no full-marks sanity term is
+    fabricated there (PROV-03). ``completeness`` counts when provided.
+    """
+    residual_score = float(np.clip(1.0 - residual_fraction / _RESIDUAL_FRACTION_TOL, 0.0, 1.0))
+    terms = [residual_score, float(np.clip(inlier_fraction, 0.0, 1.0))]
+    if sanity_margin is not None:
+        terms.append(float(np.clip(sanity_margin, 0.0, 1.0)))
+    if completeness is not None:
+        terms.append(float(np.clip(completeness, 0.0, 1.0)))
+    return float(np.clip(sum(terms) / len(terms), 0.0, 1.0))
+
+
+def _finite_difference_velocity(positions: FloatArray, times: FloatArray) -> FloatArray:
+    """Per-axis velocity via numpy gradient on possibly non-uniform time samples."""
+    if positions.shape[0] < 2:
+        return np.zeros_like(positions)
+    vel = np.empty_like(positions)
+    for axis in range(positions.shape[1]):
+        vel[:, axis] = np.gradient(positions[:, axis], times, edge_order=1)
+    return vel
+
+
+def _fitted_positions_velocity(
+    xfit: QuadraticFit, yfit: QuadraticFit, times: FloatArray, scale: float
+) -> tuple[FloatArray, FloatArray]:
+    """Positions (scaled) and analytic velocity from the robust per-axis fits.
+
+    Positions are read off the fitted curves (referenced to the segment start), so
+    down-weighted outliers do not appear in the product. Velocity is the analytic
+    derivative ``v = c1 + 2*c2*t`` of each fit — not ``np.gradient`` of noisy raw centers,
+    which would re-inject the very spikes the robust fit removed (BAL-RAWPOS).
+    """
+    n = times.shape[0]
+    x_pred = xfit.predict(times)
+    y_pred = yfit.predict(times)
+    positions = np.zeros((n, 3), dtype=np.float64)
+    positions[:, 0] = scale * (x_pred - x_pred[0])
+    positions[:, 1] = scale * (y_pred - y_pred[0])
+    velocity = np.zeros((n, 3), dtype=np.float64)
+    velocity[:, 0] = scale * (xfit.c1 + 2.0 * xfit.c2 * times)
+    velocity[:, 1] = scale * (yfit.c1 + 2.0 * yfit.c2 * times)
+    return positions, velocity
+
+
+def _build_metric_estimate(
+    xfit: QuadraticFit,
+    yfit: QuadraticFit,
+    times: FloatArray,
+    scale: float,
+    frame_range: tuple[int, int],
+    segment: Segment,
+    *,
+    source: str,
+    confidence: float,
+    gof: float,
+    meta: dict[str, object],
+) -> TrajectoryEstimate:
+    """Construct a METRIC-tier estimate from the robust fits: positions m, velocity m/s."""
+    positions_m, velocity_m = _fitted_positions_velocity(xfit, yfit, times, scale)
+    # positions_m[:, 2] stays 0: depth unknown at this monocular tier (v0.2/stereo).
+
+    note_meta = dict(meta)
+    note_meta["depth_axis"] = "unknown_at_monocular_tier_set_to_zero"
+    note_meta["trajectory_source"] = "robust_fit"
+
+    positions_q = Quantity(
+        value=positions_m, unit="m", tier=Tier.METRIC,
+        confidence=confidence, source=source, frame=frame_range,
+    )
+    velocity_q = Quantity(
+        value=velocity_m, unit="m/s", tier=Tier.METRIC,
+        confidence=confidence, source=source, frame=frame_range,
+    )
+    return TrajectoryEstimate(
+        positions=positions_q,
+        velocity=velocity_q,
+        tier=Tier.METRIC,
+        goodness_of_fit=gof,
+        segment=segment,
+        meta=note_meta,
+    )
+
+
+def _relative_fallback(
+    centers: FloatArray,
+    times: FloatArray,
+    frame_range: tuple[int, int],
+    segment: Segment,
+    *,
+    reason: str,
+    a_px: float | None = None,
+    residual_fraction: float | None = None,
+    inlier_fraction: float | None = None,
+    xfit: QuadraticFit | None = None,
+    yfit: QuadraticFit | None = None,
+) -> TrajectoryEstimate:
+    """Honest scale-free fallback: a RELATIVE estimate when metric scale is not earned.
+
+    Positions are displacements from the segment start normalized by the pixel extent (so
+    the result is scale-free / dimensionless); velocity is their per-second rate. When the
+    robust fits are available (the sanity-gate-failed path) the product is read off those
+    fits — outliers stay rejected even in the fallback — otherwise (too-short path) raw
+    centers are used. The tier is RELATIVE and NEVER METRIC (BRIEF.md §10).
+    """
+    if xfit is not None and yfit is not None:
+        x_pred = xfit.predict(times)
+        y_pred = yfit.predict(times)
+        dx = x_pred - x_pred[0]
+        dy = y_pred - y_pred[0]
+        extent = float(np.hypot(np.ptp(x_pred), np.ptp(y_pred))) or 1.0
+        positions_rel = np.zeros((times.shape[0], 3), dtype=np.float64)
+        positions_rel[:, 0] = dx / extent
+        positions_rel[:, 1] = dy / extent
+        velocity_rel = np.zeros((times.shape[0], 3), dtype=np.float64)
+        velocity_rel[:, 0] = (xfit.c1 + 2.0 * xfit.c2 * times) / extent
+        velocity_rel[:, 1] = (yfit.c1 + 2.0 * yfit.c2 * times) / extent
+    else:
+        disp_px = centers - centers[0]
+        extent = float(np.linalg.norm(np.ptp(centers, axis=0))) or 1.0
+        positions_rel = np.zeros((centers.shape[0], 3), dtype=np.float64)
+        positions_rel[:, 0] = disp_px[:, 0] / extent
+        positions_rel[:, 1] = disp_px[:, 1] / extent
+        velocity_rel = _finite_difference_velocity(positions_rel, times)
+
+    # Confidence at RELATIVE tier reflects only geometric coherence, not earned scale.
+    if residual_fraction is not None and inlier_fraction is not None:
+        residual_factor = float(
+            np.clip(1.0 - residual_fraction / _RESIDUAL_FRACTION_TOL, 0.0, 1.0)
+        )
+        confidence = combine_confidence(residual_factor, float(np.clip(inlier_fraction, 0.0, 1.0)))
+    else:
+        confidence = combine_confidence(0.5)
+
+    meta: dict[str, object] = {
+        "fallback_reason": reason,
+        "tier_note": "scale_not_earned_fell_back_to_relative",
+    }
+    if a_px is not None:
+        meta["a_px"] = a_px
+    if residual_fraction is not None:
+        meta["residual_fraction"] = residual_fraction
+    if inlier_fraction is not None:
+        meta["inlier_fraction"] = inlier_fraction
+
+    positions_q = Quantity(
+        value=positions_rel, unit=None, tier=Tier.RELATIVE,
+        confidence=confidence, source="relative_fallback", frame=frame_range,
+    )
+    velocity_q = Quantity(
+        value=velocity_rel, unit=None, tier=Tier.RELATIVE,
+        confidence=confidence, source="relative_fallback", frame=frame_range,
+    )
+    return TrajectoryEstimate(
+        positions=positions_q,
+        velocity=velocity_q,
+        tier=Tier.RELATIVE,
+        goodness_of_fit=float(np.clip(confidence, 0.0, 1.0)),
+        segment=segment,
+        meta=meta,
+    )

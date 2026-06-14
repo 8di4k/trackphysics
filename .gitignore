@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+build/
+dist/
+.eggs/
+
+# Environments
+.venv/
+venv/
+env/
+
+# Tooling caches
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/
+.coverage
+htmlcov/
+
+# OS / editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# NOTE: bench/report/ is intentionally committed — it is the published
+# accuracy/robustness envelope linked from the README (BRIEF.md §14.5, §17).
+
+# Internal build brief — strategy / GTM / competitive analysis. Kept local, not published.
+BRIEF.md
