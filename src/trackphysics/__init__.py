@@ -11,7 +11,7 @@ from .core.adapters.generic import from_csv, from_generic
 from .core.adapters.supervision import from_supervision
 from .core.analysis import analyze
 from .core.events import BounceDetector, ReleaseDetector, detect_contacts
-from .core.grounding import GroundingContext, Plane
+from .core.grounding import DepthDominationGuard, GroundingContext, Plane
 from .core.kinematics import compute_kinematics
 from .core.lift import relative_lift
 from .core.presets import SpherePreset
@@ -37,6 +37,7 @@ __version__ = "0.1.0.dev0"
 __all__ = [
     "AnalysisResult",
     "BounceDetector",
+    "DepthDominationGuard",
     "Detection",
     "Event",
     "EventDetector",

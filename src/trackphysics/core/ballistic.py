@@ -635,9 +635,37 @@ def fit_ballistic(
     gof = _goodness_of_fit(
         residual_fraction, inlier_fraction, sanity_margin=sanity_margin, completeness=completeness
     )
+    guard_meta: dict[str, object] = {}
+    systematic_floor = _SYSTEMATIC_REL_FLOOR
+
+    # Opt-in point-only depth-domination guard (§10 tier-hole, BAL-DEPTH-GUARD). An object
+    # flying along the optical axis still fits a clean in-plane parabola, so the gate above
+    # trusts it — but the in-plane metric then captures only a fraction of the true 3D motion.
+    # The in-plane aspect ratio (horizontal/vertical pixel extent) is a point-only proxy: low
+    # aspect => depth-dominated. CONTINUOUS confidence discount + CI widening as it rises, with
+    # a CONSERVATIVE hard downgrade past the 'hopeless' floor. Default-OFF; behaviour unchanged
+    # unless a caller supplies an enabled guard. Flagging depth-domination is NOT recovering
+    # depth (that needs stereo/size).
+    guard = ctx.depth_guard
+    if guard is not None and guard.enabled:
+        extent_h = float(np.ptp(centers[:, 0]))
+        extent_v = float(np.ptp(centers[:, 1]))
+        aspect = extent_h / (extent_v + 1e-9)
+        if aspect <= guard.hard_aspect:
+            return _relative_fallback(
+                centers, times, frame_range, segment, reason="depth_domination_downgrade",
+                a_px=a_px, residual_fraction=residual_fraction, inlier_fraction=inlier_fraction,
+                xfit=xfit, yfit=yfit,
+            )
+        score = guard.depth_score(aspect)
+        confidence = confidence * (1.0 - guard.confidence_penalty * score)
+        systematic_floor = _SYSTEMATIC_REL_FLOOR * (1.0 + guard.ci_widen * score)
+        guard_meta = {"in_plane_aspect": aspect, "depth_domination_score": score}
+
     return _build_metric_estimate(
         xfit, yfit, times, scale, frame_range, segment,
         source="ballistic_fit", confidence=confidence, gof=gof,
+        systematic_rel_floor=systematic_floor,
         meta={
             "scale_m_per_px": scale,
             "a_px": a_px,
@@ -645,6 +673,7 @@ def fit_ballistic(
             "inlier_fraction": inlier_fraction,
             "residual_fraction": residual_fraction,
             "completeness": completeness,
+            **guard_meta,
         },
     )
 
@@ -786,6 +815,7 @@ def _launch_speed_and_ci(
     scale: float,
     *,
     scale_from_gravity: bool,
+    systematic_rel_floor: float = _SYSTEMATIC_REL_FLOOR,
 ) -> tuple[float, tuple[float, float] | None]:
     """Launch speed (m/s) at the segment start and its 95% confidence interval.
 
@@ -795,11 +825,15 @@ def _launch_speed_and_ci(
     violated assumption (e.g. a pitched camera), which is exactly why a coverage test
     against an independent ground truth is meaningful (an overconfident, biased estimate
     yields a tight CI that fails to cover the truth).
+
+    ``systematic_rel_floor`` is the relative systematic-uncertainty floor; callers may widen
+    it above :data:`_SYSTEMATIC_REL_FLOOR` (e.g. the depth-domination guard, where the
+    recovered scale is depth-biased).
     """
     vx0, vy0 = float(xfit.c1), float(yfit.c1)
     s_px = float(np.hypot(vx0, vy0))
     speed = float(scale * s_px)
-    systematic_half = _SYSTEMATIC_REL_FLOOR * abs(speed)
+    systematic_half = systematic_rel_floor * abs(speed)
 
     def _floor_only() -> tuple[float, tuple[float, float] | None]:
         # The systematic floor is always defensible (depends only on speed). Emit it even
@@ -850,6 +884,7 @@ def _build_metric_estimate(
     confidence: float,
     gof: float,
     meta: dict[str, object],
+    systematic_rel_floor: float = _SYSTEMATIC_REL_FLOOR,
 ) -> TrajectoryEstimate:
     """Construct a METRIC-tier estimate from the robust fits: positions m, velocity m/s."""
     positions_m, velocity_m = _fitted_positions_velocity(xfit, yfit, times, scale)
@@ -861,7 +896,8 @@ def _build_metric_estimate(
     # Launch speed + 95% CI (parametric, from the fit). A consumer/validator reads these
     # directly; the CI lets a coverage test catch overconfident (biased) metric output.
     launch_speed, ci95 = _launch_speed_and_ci(
-        xfit, yfit, times, scale, scale_from_gravity=(source != "reference_scale")
+        xfit, yfit, times, scale, scale_from_gravity=(source != "reference_scale"),
+        systematic_rel_floor=systematic_rel_floor,
     )
     note_meta["launch_speed_m_s"] = launch_speed
     note_meta["launch_speed_ci95"] = ci95

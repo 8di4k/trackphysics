@@ -110,3 +110,41 @@ picture:
 `validation/calibrate.py` + `validation/make_tt3d_dump.py` are committed as **refittable
 artifacts** (code only — no TT3D numbers; the fitted coefficients are deployment-specific and
 must never enter the core, §6). Quantitatives remain in the internal artifact (license).
+
+---
+
+## 2026-06-15 — B implemented: opt-in depth-domination guard (point-only §10 tier-hole fix)
+
+The §10 tier-hole (the gate trusting depth-dominated arcs) is now closed by an **opt-in,
+default-OFF** guard (`DepthDominationGuard` on `GroundingContext`; logic in
+`ballistic.fit_ballistic`). Rationale for shipping now, not queuing: the hole is live in the
+engine, the fix is validated on the data we have, and a flag + default-OFF + refittable
+thresholds is a *tested opt-in capability with unchanged default behaviour*, not a hardcoded
+claim. Holding a validated §10 fix out of the code while the hole is open is the wrong trade.
+
+Design (as specified):
+- **Continuum, not a cliff.** The in-plane aspect ratio (a point-only, scale-invariant shape
+  feature; low aspect ⇒ depth-dominated) drives a *continuous* confidence discount and CI
+  widening between a soft and a hard aspect threshold. A *conservative hard downgrade*
+  (METRIC→RELATIVE) fires only past the hard "hopeless" floor — so the ambiguous middle is
+  penalised continuously, not thrown away.
+- **Validated at the operating point, not the monotone average.** On the held data the
+  downgrade decision at the default thresholds is **high-precision with a very small
+  false-downgrade rate** (a downgrade is a safe under-claim, so the floor is tuned that way);
+  recall is intentionally conservative, with the missed (ambiguous) arcs covered by the
+  continuous penalty rather than a hard cut. The metric set that survives is measurably more
+  3D-honest. (Reproduce: `python -m validation.depth_guard_operating_point --root <eval>`;
+  numbers are internal — license.)
+- **Maturity ladder.** Thresholds are a refittable artifact, provenance "calibrated on one
+  evaluation set", **default-OFF**. Promotion to default-ON requires validation on a SECOND
+  domain (one set / three views / one sport is enough for opt-in, not for a default). The
+  mechanism (aspect → 2D geometry) is domain-agnostic (§6); only the tuned numbers are
+  domain-flavoured, and they never enter the core as behaviour-changing defaults.
+
+**Kept distinct (do not let this blur):** *flagging* depth-domination (B, point-only, done) ≠
+*recovering* depth (needs stereo / a real detector's size channel). B stops the engine
+over-trusting an in-plane metric; it does not restore the missing 3-D component.
+
+**Next:** (3) per-deployment refittable calibrator (in-distribution de-bias + input-conditioned
+CI, reusing the same aspect machinery); then default-ON + cross-geometry de-bias once a second
+domain / a viewpoint continuum is available.
