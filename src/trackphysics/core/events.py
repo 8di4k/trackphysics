@@ -40,9 +40,17 @@ from .schema import FloatArray, TrackSequence
 # Therefore an object moving downward in the scene has POSITIVE pixel ``y``-velocity, and
 # an object moving upward has NEGATIVE pixel ``y``-velocity. A bounce/impact off a surface
 # below the object is thus a transition from positive (down) to negative (up) vertical
-# velocity. For a metric/relative estimate the world ``y`` (or ``z``) axis points *up*, so
-# the same physical bounce appears as negative→positive on that axis; the detector keys
-# off the reversal regardless of axis sign convention (see :func:`_bounce_indices`).
+# velocity. The detector keys off the *reversal* regardless of which sign comes first (see
+# :func:`_bounce_indices`), so it is valid whether the vertical axis points up or down.
+#
+# Spatial-array layout convention (see lift.relative_lift and ballistic._fitted_positions
+# _velocity): the engine's position/velocity arrays are ordered
+# ``[in-plane horizontal, in-plane vertical, depth]``. The VERTICAL (gravity) axis is
+# therefore column index ``_VERTICAL_AXIS`` (= 1) for BOTH ``(T, 2)`` pixel arrays
+# (``[x, y]``) and ``(T, 3)`` lifted arrays (``[x, y, depth]``) — it is NOT the last column,
+# which for a 3-D array is depth (the optical axis, ~0 at the monocular tier). Keying off
+# the last column would read the depth channel and miss every real vertical reversal.
+_VERTICAL_AXIS = 1
 
 
 def _column(arr: FloatArray, index: int) -> FloatArray:
@@ -77,20 +85,21 @@ def _finite_difference(values: FloatArray, times: FloatArray) -> FloatArray:
 def _vertical_velocity_series(est: TrajectoryEstimate, track: TrackSequence) -> FloatArray:
     """Extract the vertical-velocity series implied by an estimate.
 
-    Prefers the estimate's own ``velocity`` array. A ``(T, D)`` velocity uses its last
-    spatial column as the vertical axis (world up-axis for 3D, pixel-``y`` for 2D). A
-    ``(T,)`` scalar series cannot expose a signed vertical component, so we fall back to
-    differencing the vertical position. If neither is array-valued, we difference the
-    track's pixel centers as a last resort.
+    Prefers the estimate's own ``velocity`` array. A 2-D ``(T, D)`` velocity uses column
+    ``_VERTICAL_AXIS`` (= 1) as the vertical axis — correct for both the engine's ``(T, 3)``
+    ``[x, y, depth]`` lifts and its ``(T, 2)`` ``[x, y]`` pixel velocities (see the
+    module-level layout convention). A ``(T,)`` scalar series cannot expose a signed
+    vertical component, so we fall back to differencing the vertical position. If neither is
+    array-valued, we difference the track's pixel centers as a last resort.
     """
     vel = est.velocity.value
-    if isinstance(vel, np.ndarray) and vel.ndim == 2 and vel.shape[1] >= 2:
-        return _column(vel, vel.shape[1] - 1)
+    if isinstance(vel, np.ndarray) and vel.ndim == 2 and vel.shape[1] > _VERTICAL_AXIS:
+        return _column(vel, _VERTICAL_AXIS)
 
     pos = est.positions.value
     times = _estimate_times(est, track)
-    if isinstance(pos, np.ndarray) and pos.ndim == 2 and pos.shape[1] >= 2:
-        vertical_pos = _column(pos, pos.shape[1] - 1)
+    if isinstance(pos, np.ndarray) and pos.ndim == 2 and pos.shape[1] > _VERTICAL_AXIS:
+        vertical_pos = _column(pos, _VERTICAL_AXIS)
         return _finite_difference(vertical_pos, times)
 
     # Last resort: difference the track's pixel-y centers over the segment window.

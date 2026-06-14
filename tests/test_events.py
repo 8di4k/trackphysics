@@ -331,6 +331,80 @@ def test_release_does_not_fire_on_pure_noise() -> None:
 
 
 # --------------------------------------------------------------------------------------
+# (e) Engine (T, 3) layout: the vertical axis is column 1, NOT the last column
+#     Regression guard for EVENTS-VERTICAL-AXIS — reading the last column read the DEPTH
+#     channel (~0 at the monocular tier), silently disabling bounce/release on every real
+#     (T, 3) estimate the engine produces. The (T, 2) fixtures above could not catch it
+#     because for 2-D arrays column 1 IS the last column.
+# --------------------------------------------------------------------------------------
+
+
+def _estimate_3d_layout(
+    vertical: np.ndarray,
+    *,
+    depth: np.ndarray | None = None,
+    tier: Tier = Tier.RELATIVE,
+    gof: float = 0.9,
+    segment: Segment | None = None,
+) -> tuple[TrajectoryEstimate, TrackSequence]:
+    """Build a (T, 3) ``[horizontal, vertical, depth]`` estimate in the ENGINE's layout."""
+    t = vertical.shape[0]
+    horiz = np.full(t, 3.0, dtype=np.float64)
+    depth_col = np.zeros(t, dtype=np.float64) if depth is None else depth
+    velocity = np.stack([horiz, vertical, depth_col], axis=1)
+    positions = np.cumsum(velocity, axis=0) / FPS
+    centers = positions[:, :2] * 100.0 + 500.0
+    track = _track_from_centers(centers)
+    est = TrajectoryEstimate(
+        positions=Quantity(positions, unit=None, tier=tier, confidence=0.9, source="t"),
+        velocity=Quantity(velocity, unit=None, tier=tier, confidence=0.9, source="t"),
+        tier=tier,
+        goodness_of_fit=gof,
+        segment=segment,
+    )
+    return est, track
+
+
+def test_bounce_keys_off_vertical_not_depth_in_3d_layout() -> None:
+    reversal = np.concatenate([np.full(6, 4.0), np.full(6, -4.0)])
+    flat = np.full(12, 4.0)
+    # Reversal in the VERTICAL column (1) fires...
+    est, track = _estimate_3d_layout(reversal, depth=flat)
+    assert [e.frame for e in BounceDetector().detect(est, track)] == [6]
+    # ...but a reversal in the DEPTH column (2, the last) is NOT a bounce and must be ignored.
+    est2, track2 = _estimate_3d_layout(flat, depth=reversal)
+    assert BounceDetector().detect(est2, track2) == []
+
+
+def test_bounce_detected_end_to_end_via_analyze() -> None:
+    # The true regression test: with no preset, analyze() runs BounceDetector over the
+    # relative lift — a (T, 3) [x, y, depth] estimate. An object that rises then falls in the
+    # image has a clear vertical-velocity reversal (the apex); before the axis fix this
+    # surfaced NOTHING because the detector read the flat depth channel.
+    from trackphysics.core.analysis import analyze
+
+    n = 16
+    ys = np.concatenate([np.linspace(300.0, 100.0, 8), np.linspace(100.0, 300.0, 8)])
+    xs = np.linspace(100.0, 400.0, n)
+    track = _track_from_centers(np.stack([xs, ys], axis=1))  # constant bbox -> flat depth
+    result = analyze(track)
+    impacts = [e for e in result.events if e.kind in ("impact", "bounce")]
+    assert impacts, "a vertical-velocity reversal (apex) must surface as a generic impact"
+    assert any(6 <= e.frame <= 9 for e in impacts)
+
+
+def test_release_fires_on_engine_3d_layout() -> None:
+    # ReleaseDetector's velocity-search path also routes through _vertical_velocity_series.
+    flat = np.full(6, 0.0)
+    ramp = np.linspace(0.0, 9.0, 10)
+    est, track = _estimate_3d_layout(np.concatenate([flat, ramp]), gof=0.85)
+    events = ReleaseDetector().detect(est, track)
+    assert len(events) == 1
+    assert events[0].kind == "release"
+    assert 4 <= events[0].frame <= 9
+
+
+# --------------------------------------------------------------------------------------
 # Protocol conformance: detectors satisfy the EventDetector contract
 # --------------------------------------------------------------------------------------
 
