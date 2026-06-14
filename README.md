@@ -68,7 +68,7 @@ lives in [`examples/hero_speed.py`](examples/hero_speed.py):
 
 ```text
 $ python examples/hero_speed.py
-launch speed = 9.07 m/s  (tier=metric, conf=1.00)      # true speed 9.22 m/s
+launch speed = 9.10 m/s  (tier=metric, conf=1.00)      # true speed 9.22 m/s
 ```
 
 The scale here is recovered purely from gravity acting as a ruler — no court/field

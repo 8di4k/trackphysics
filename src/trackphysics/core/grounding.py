@@ -63,8 +63,22 @@ class GroundingContext:
 
     @property
     def has_metric_reference(self) -> bool:
-        """True if the caller supplied any explicit metric grounding."""
+        """True if the caller supplied any explicit metric grounding (plane and/or scale).
+
+        Note: a ``reference_plane`` alone does NOT fix a pixel-to-meter scale in monocular
+        v0.1 (that needs camera intrinsics, a v0.2 concern) — use :attr:`has_metric_scale`
+        to ask whether scale is actually grounded.
+        """
         return self.reference_plane is not None or self.reference_scale is not None
+
+    @property
+    def has_metric_scale(self) -> bool:
+        """True if the context can actually fix a metric scale in v0.1.
+
+        Only a ``reference_scale`` does so monocularly; a plane alone cannot (see
+        :attr:`has_metric_reference`). This is what determines whether the engine could earn
+        METRIC tier from the grounding rather than from gravity-as-a-ruler."""
+        return self.reference_scale is not None
 
 
 __all__ = ["GroundingContext", "Plane"]

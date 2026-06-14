@@ -123,12 +123,17 @@ def _vertex_angles(
 def _angular_velocity(angles: FloatArray, times: FloatArray) -> FloatArray:
     """Finite-difference time derivative of an angle series, shape ``(T,)``, in rad/s.
 
-    Uses unwrapped angles so a wrap across the ``[0, pi]`` fold does not inject a spurious
-    spike, and central differences over real seconds (one-sided at the ends). Frames whose
-    angle is ``NaN`` (gated out) propagate ``NaN`` into the adjacent derivative samples that
-    depend on them, so an unreliable frame never silently produces a confident velocity.
-    Returns all-``NaN`` if fewer than two finite angle samples exist or times are not
-    strictly increasing.
+    Central differences over real seconds (one-sided at the ends). Frames whose angle is
+    ``NaN`` (gated out) propagate ``NaN`` into the adjacent derivative samples that depend on
+    them, so an unreliable frame never silently produces a confident velocity. Returns
+    all-``NaN`` if fewer than two finite angle samples exist or times are not strictly
+    increasing.
+
+    Note: the angles are the UNSIGNED interior angle in ``[0, pi]`` (``arctan2(|cross|,
+    dot)``), so no ``2*pi`` wrap is possible and ``np.unwrap`` would be a no-op — we do not
+    apply it. The genuine artifact for an unsigned angle is *reflection* at the 0/pi folds
+    (the rate sign flips), which unwrap cannot fix anyway; a signed angle would be needed for
+    a continuous rate and is a v0.2 concern.
     """
     n = angles.shape[0]
     if n < 2 or not np.all(np.diff(times) > 0):
@@ -136,11 +141,10 @@ def _angular_velocity(angles: FloatArray, times: FloatArray) -> FloatArray:
     finite = np.isfinite(angles)
     if finite.sum() < 2:
         return np.full(n, np.nan, dtype=np.float64)
-    # Unwrap only over the finite samples to avoid NaN poisoning the unwrap, then gradient
-    # over the full grid; NaNs re-enter via the validity mask below.
-    unwrapped = np.array(angles, dtype=np.float64)
-    unwrapped[finite] = np.unwrap(angles[finite])
-    grad = np.gradient(unwrapped, times, axis=0)
+    # NaN-gated frames stay NaN in the array; np.gradient's central difference does not use
+    # the sample itself for interior points, so a finite derivative survives where both
+    # neighbours are finite. The validity mask below re-asserts NaN where a neighbour is gated.
+    grad = np.gradient(angles, times, axis=0)
     # A derivative sample is trustworthy only if the angle samples it consumed are finite.
     valid = finite.copy()
     valid[1:-1] = finite[:-2] & finite[2:]  # central difference neighbours

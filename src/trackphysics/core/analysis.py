@@ -91,7 +91,9 @@ def analyze(
         "preset": resolved.name if resolved is not None else None,
         "n_trajectories": len(trajectories),
         "tiers": [t.tier.value for t in trajectories],
-        "grounded": ctx.has_metric_reference,
+        # Report whether scale is actually grounded (a plane alone does not fix scale in
+        # v0.1), so the flag matches the tier the engine could earn from the grounding.
+        "grounded": ctx.has_metric_scale,
     }
     return AnalysisResult(
         trajectories=trajectories,

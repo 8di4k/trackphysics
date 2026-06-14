@@ -110,6 +110,26 @@ def test_impute_gaps_fills_coherent_gap() -> None:
     assert abs(float(filled) - 12.0) < 1.0
 
 
+def test_impute_gaps_fills_curved_arc_along_the_curve_not_a_chord() -> None:
+    # A stitched gap over an ACCELERATING (parabolic) arc must be filled along the validated
+    # curve, not a straight chord (ROB-FILL-CHORD). For a pure quadratic the curvature-
+    # preserving fill is exact, whereas a chord across the gap deviates by the sagitta.
+    frames = np.array([0, 1, 2, 3, 4, 5, 11, 12, 13, 14], dtype=np.float64)  # gap 6..10
+    accel = 2.0
+    vals = 0.5 * accel * frames**2
+    res = impute_gaps(frames, vals, coherence_tol=5.0, max_gap=15, n_post=3)
+    assert res.gaps[0].stitched is True
+
+    gap_mask = ~res.observed_mask
+    truth = 0.5 * accel * res.frames**2
+    curved_err = float(np.max(np.abs(res.values[gap_mask] - truth[gap_mask])))
+    chord = np.interp(res.frames, [5.0, 11.0], [0.5 * accel * 25, 0.5 * accel * 121])
+    chord_err = float(np.max(np.abs(chord[gap_mask] - truth[gap_mask])))
+    assert curved_err < 1e-6  # exact for a quadratic
+    assert chord_err > 5.0  # the chord is badly biased here
+    assert curved_err < chord_err
+
+
 def test_impute_gaps_refuses_incoherent_jump() -> None:
     # Linear motion before the gap, then a large teleport after it (id-switch-like).
     pre_frames = np.arange(0, 6, dtype=np.float64)

@@ -34,6 +34,7 @@ from dataclasses import dataclass, field
 from typing import Protocol
 
 import numpy as np
+import numpy.typing as npt
 
 from ..schema import FloatArray
 from .smoothing import SmoothingResult, robust_smooth
@@ -123,9 +124,10 @@ def impute_gaps(
     (plus a leading context window) and predicts across the gap. It then checks the
     first ``n_post`` observations after the gap against that prediction. If the worst
     normalised deviation is within ``coherence_tol`` robust sigmas, the gap is stitched
-    (filled by interpolating the predicted endpoints into the observed ones); otherwise
-    it is recorded as segment-terminating (``stitched=False``) and the missing frames
-    are left as ``nan``.
+    (filled with the SAME curved continuation the gate validated — the pre-window
+    polynomial, endpoint-corrected to meet both observations exactly, not a straight chord);
+    otherwise it is recorded as segment-terminating (``stitched=False``) and the missing
+    frames are left as ``nan``.
 
     Args:
         frames: Ascending frame indices of the observations, shape ``(T,)``.
@@ -202,7 +204,7 @@ def impute_gaps(
         )
 
         if stitched:
-            _fill_linear(out, idx_in_full, k, dim)
+            _fill_curved(out, full_frames, idx_in_full, k, pre_f, pre_y, dim)
 
         gaps.append(
             GapRecord(
@@ -308,18 +310,46 @@ def _extrapolate(
     return out
 
 
-def _fill_linear(
-    out: FloatArray, idx_in_full: FloatArray, k: int, dim: int
+def _fill_curved(
+    out: FloatArray,
+    full_frames: npt.NDArray[np.int64],
+    idx_in_full: npt.NDArray[np.int64],
+    k: int,
+    pre_f: FloatArray,
+    pre_y: FloatArray,
+    dim: int,
 ) -> None:
-    """Linearly interpolate the dense grid between observed endpoints of a gap."""
+    """Fill a stitched gap with the SAME curved continuation the coherence gate validated.
+
+    The gate accepts a gap because the pre-window's degree-2 (curved) extrapolation stays
+    coherent with the post-gap observations. A straight chord between the observed endpoints
+    discards exactly that curvature, so for any accelerating / ballistic / drag arc the
+    imputed points are systematically biased (ROB-FILL-CHORD). Instead we evaluate the
+    pre-window polynomial across the gap and add the unique *linear* correction that makes
+    the filled curve pass through both observed endpoints exactly — preserving the validated
+    second derivative while staying continuous with the real observations.
+    """
     lo = int(idx_in_full[k - 1])
     hi = int(idx_in_full[k])
     n_steps = hi - lo
+    if n_steps <= 1:
+        return
+    gap_local = np.arange(lo + 1, hi)
+    gap_frames = full_frames[gap_local].astype(np.float64)
+    t_lo = float(full_frames[lo])
+    t_hi = float(full_frames[hi])
+    pre_y2d = pre_y if pre_y.ndim == 2 else pre_y.reshape(-1, 1)
+    deg = min(2, max(0, pre_f.shape[0] - 1))
+    span = t_hi - t_lo
+    w = (gap_frames - t_lo) / span if span != 0 else np.zeros_like(gap_frames)
     for c in range(dim):
-        a = out[lo, c]
-        b = out[hi, c]
-        for s in range(1, n_steps):
-            out[lo + s, c] = a + (b - a) * (s / n_steps)
+        coeffs = np.polyfit(pre_f, pre_y2d[:, c], deg)
+        q_gap = np.polyval(coeffs, gap_frames)
+        # Linear endpoint correction: the curve follows the fitted curvature but is shifted
+        # so it hits the observed out[lo] and out[hi] exactly (no discontinuity at the seams).
+        corr_lo = float(out[lo, c]) - float(np.polyval(coeffs, t_lo))
+        corr_hi = float(out[hi, c]) - float(np.polyval(coeffs, t_hi))
+        out[gap_local, c] = q_gap + corr_lo + (corr_hi - corr_lo) * w
 
 
 __all__ = ["GapRecord", "ImputationResult", "impute_gaps"]

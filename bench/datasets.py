@@ -44,8 +44,14 @@ def load_latte_mv(root: str | Path, *, fps: float = 120.0) -> list[TrackSequence
 
     Expects a locally-prepared directory of per-clip CSVs with columns
     ``frame,track_id,x1,y1,x2,y2`` (convert the released tracking CSVs to this layout).
-    The 3D reconstructions shipped with LATTE-MV are the validation ground truth for
-    recovered metric estimates and a baseline to compare against.
+
+    GROUND-TRUTH WARNING: LATTE-MV's shipped 3D is itself *monocular-reconstructed*
+    (plane projection + projectile/Stokes-drag self-calibration), so it is NOT independent
+    ground truth for a monocular metric estimator — comparing against it would be circular
+    (validate the engine against numbers produced the same way it produces them). Use these
+    LATTE-MV tracks as a real-data INPUT / sim2real exercise only. The primary independent
+    3D truth is TT3D (multi-camera); see ``validation/`` and the
+    ``validation-ground-truth-strategy`` project memory.
     """
     root_dir = _require_dir(root, "LATTE-MV", LATTE_MV_URL)
     tracks: list[TrackSequence] = []
