@@ -147,6 +147,56 @@ def apply_correlated_jitter(
     return _rebuild(track, dets)
 
 
+def apply_size_noise(
+    track: TrackSequence,
+    *,
+    sigma_px: float,
+    rho: float,
+    rng: np.random.Generator,
+) -> TrackSequence:
+    """Add AR(1)-correlated noise to box SIZE (extent), holding the centroid fixed.
+
+    Distinct from :func:`apply_correlated_jitter`, which *translates* the box and therefore
+    preserves its size: this perturbs the apparent box *extent* — the size channel the
+    object-size-as-ruler reads — leaving the centre untouched. It models a detector's
+    box-regression noise on the size dimension, the limiting factor for size-derived scale.
+
+    The same AR(1) increment ``e_t`` is added to the half-width and half-height each frame
+    (a pure isotropic size wobble), clamped so extents stay positive. The resulting apparent
+    diameter (geometric mean of width and height) wobbles by ``~2 * e_t``. ``rho`` in
+    ``[0, 1)`` sets the temporal correlation; ``rho = 0`` reduces to IID size noise.
+
+    Note: the positivity clamp rectifies large negative excursions, so it induces a small
+    UPWARD apparent-size bias that grows only at very low snr_abs (sub-noise regime, where
+    the size channel is already refused) — negligible in the usable range.
+    """
+    if sigma_px < 0:
+        raise ValueError("sigma_px must be non-negative")
+    if not 0.0 <= rho < 1.0:
+        raise ValueError("rho must be in [0, 1)")
+    dets = [_clone_detection(d) for d in track.detections]
+    n = len(dets)
+    if n == 0 or sigma_px == 0.0:
+        return _rebuild(track, dets)
+
+    innov_scale = np.sqrt(1.0 - rho * rho) * sigma_px
+    noise = np.empty(n, dtype=np.float64)
+    prev = float(rng.standard_normal() * sigma_px)  # stationary-variance initial state
+    noise[0] = prev
+    for i in range(1, n):
+        prev = rho * prev + innov_scale * float(rng.standard_normal())
+        noise[i] = prev
+
+    eps = 1e-3
+    for det, e in zip(dets, noise, strict=True):
+        x0, y0, x1, y1 = det.bbox
+        cx, cy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
+        hw = max(0.5 * (x1 - x0) + e, eps)
+        hh = max(0.5 * (y1 - y0) + e, eps)
+        det.bbox = np.array([cx - hw, cy - hh, cx + hw, cy + hh], dtype=np.float64)
+    return _rebuild(track, dets)
+
+
 def apply_false_positives_dropouts(
     track: TrackSequence,
     *,
@@ -198,6 +248,8 @@ class CorruptionConfig:
 
     jitter_sigma_px: float = 0.0
     jitter_rho: float = 0.0
+    size_noise_sigma_px: float = 0.0
+    size_noise_rho: float = 0.0
     fp_rate: float = 0.0
     drop_rate: float = 0.0
     id_switch_rate: float = 0.0
@@ -215,6 +267,10 @@ def corrupt(
     if config.jitter_sigma_px > 0.0:
         out = apply_correlated_jitter(
             out, sigma_px=config.jitter_sigma_px, rho=config.jitter_rho, rng=rng
+        )
+    if config.size_noise_sigma_px > 0.0:
+        out = apply_size_noise(
+            out, sigma_px=config.size_noise_sigma_px, rho=config.size_noise_rho, rng=rng
         )
     if config.fp_rate > 0.0 or config.drop_rate > 0.0:
         out = apply_false_positives_dropouts(
@@ -235,5 +291,6 @@ __all__ = [
     "apply_false_positives_dropouts",
     "apply_gap_bursts",
     "apply_id_switches",
+    "apply_size_noise",
     "corrupt",
 ]

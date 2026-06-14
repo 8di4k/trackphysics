@@ -1,0 +1,50 @@
+{
+  "clean": [
+    {
+      "geometry": "side_on",
+      "size_ruler_per_frame_err": 1.0399784404548729e-15,
+      "gravity_scale_err_vs_truth": 0.007441071143804641,
+      "cross_check_rel_disc": 0.007446242418082805
+    },
+    {
+      "geometry": "depth_motion",
+      "size_ruler_per_frame_err": 1.051934863816524e-15,
+      "gravity_scale_err_vs_truth": 0.3893246448794746,
+      "cross_check_rel_disc": 0.2797046609213315
+    },
+    {
+      "geometry": "steep_tilt",
+      "size_ruler_per_frame_err": 7.627130847945249e-16,
+      "gravity_scale_err_vs_truth": 0.5808125242115268,
+      "cross_check_rel_disc": 0.36741349940712004
+    }
+  ],
+  "snr_sweep": {
+    "snr_abs": [
+      50.54818974754949,
+      41.76896089166351,
+      24.84287673657279,
+      13.166997626128785,
+      6.4164230323116485,
+      3.3176625660361356,
+      1.715606887870959
+    ],
+    "scale_err": [
+      0.00487217449554248,
+      0.013187400263783598,
+      0.0253879301894567,
+      0.05221571719852436,
+      0.10528246937274419,
+      0.20005126050645133,
+      0.3829951680087874
+    ],
+    "breakpoint_snr_abs": 6.892391877883122
+  },
+  "real_regime": {
+    "snr_abs": 10.0,
+    "snr_dyn": 2.5,
+    "interpolated_scale_err": 0.07252609742473681,
+    "depth_recovery_feasible": false
+  },
+  "scale_err_tol": 0.1
+}

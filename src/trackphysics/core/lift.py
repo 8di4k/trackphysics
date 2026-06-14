@@ -37,27 +37,13 @@ from __future__ import annotations
 
 import numpy as np
 
+from .objsize import apparent_size_px
 from .provenance import Quantity, Tier, TrajectoryEstimate, combine_confidence
 from .schema import FloatArray, Segment, TrackSequence
 
 __all__ = ["relative_lift"]
 
 _EPS = 1e-9
-
-
-def _apparent_size(bboxes: FloatArray) -> FloatArray:
-    """Per-frame apparent-size scalar from xyxy bboxes, shape ``(T,)``.
-
-    Uses the geometric mean of width and height so the proxy is insensitive to anisotropic
-    aspect changes and degrades gracefully for thin boxes. Non-positive extents are
-    clamped to a small epsilon so the proxy stays finite for degenerate detections.
-    """
-    widths = np.abs(bboxes[:, 2] - bboxes[:, 0])
-    heights = np.abs(bboxes[:, 3] - bboxes[:, 1])
-    widths = np.maximum(widths, _EPS)
-    heights = np.maximum(heights, _EPS)
-    sizes: FloatArray = np.sqrt(widths * heights)
-    return sizes
 
 
 def _normalized_xy(centers: FloatArray, image_size: tuple[int, int] | None) -> FloatArray:
@@ -205,12 +191,12 @@ def relative_lift(track: TrackSequence) -> TrajectoryEstimate:
             meta={"empty": True},
         )
 
-    bboxes = np.stack([d.bbox for d in track.detections])
+    bboxes = track.bboxes()
     centers = track.centers()
     times = track.times()
 
     xy = _normalized_xy(centers, track.image_size)
-    z = _relative_depth(_apparent_size(bboxes))
+    z = _relative_depth(apparent_size_px(bboxes))
     pos = np.empty((n, 3), dtype=np.float64)
     pos[:, :2] = xy
     pos[:, 2] = z

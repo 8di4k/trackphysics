@@ -166,6 +166,16 @@ class TrackSequence:
             return np.empty((0, 2), dtype=np.float64)
         return np.stack([d.center for d in self.detections])
 
+    def bboxes(self) -> FloatArray:
+        """Per-detection bounding boxes, shape ``(T, 4)`` in ``xyxy`` pixels.
+
+        The apparent-size channel (object-size-as-ruler, the relative-3D depth proxy) reads
+        box *extent* from here; ``centers()`` reads only position. Empty track -> ``(0, 4)``.
+        """
+        if not self.detections:
+            return np.empty((0, 4), dtype=np.float64)
+        return np.stack([d.bbox for d in self.detections])
+
 
 @dataclass
 class Segment:

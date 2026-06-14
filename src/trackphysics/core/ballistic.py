@@ -45,6 +45,7 @@ import numpy as np
 import numpy.typing as npt
 
 from .grounding import GroundingContext
+from .objsize import apparent_size_px, read_object_size, scale_agreement
 from .provenance import Quantity, Tier, TrajectoryEstimate, combine_confidence
 from .schema import FloatArray, Segment, TrackSequence
 from .shape import inplane_shape_features
@@ -83,6 +84,22 @@ _RESIDUAL_FRACTION_TOL = 0.05
 
 _MIN_INLIER_FRACTION = 0.6
 """Fraction of segment points that must survive RANSAC+IRLS for a trusted fit."""
+
+_SIZE_AGREEMENT_TOL = 0.25
+"""Relative discrepancy between the size-ruler and gravity-ruler scales mapped to zero
+agreement (the cross-check's confidence multiplier reaches 0 here). Calibrated on synthetic
+sweeps (``bench/size_ruler.py``); refittable, not a universal constant (§10)."""
+
+_SIZE_CI_WIDEN = 2.0
+"""The metric CI's systematic half-width is scaled by ``1 + _SIZE_CI_WIDEN * rel_disc``
+when an informative size ruler DISAGREES with the gravity scale — an independent cue that
+the recovered scale is biased (typically by depth motion) widens the honest band."""
+
+_SIZE_MAX_WIDEN_DISC = 10.0
+"""Cap on the relative-discrepancy term that feeds the CI widening, so a pathological (e.g.
+overflowing) ``rel_disc`` cannot produce a non-finite CI bound. At this point ``agreement``
+is already 0, so the cap keeps the band finite without weakening the maximally-cautious
+intent (a ~21x-widened systematic floor)."""
 
 _SYSTEMATIC_REL_FLOOR = 0.08
 """Relative systematic-uncertainty floor on the recovered launch speed.
@@ -514,6 +531,7 @@ def fit_ballistic(
     segment: Segment,
     ctx: GroundingContext,
     *,
+    diameter_m: float | None = None,
     rng: np.random.Generator | None = None,
 ) -> TrajectoryEstimate:
     """Fit a ballistic arc and recover metric scale by gravity-as-a-ruler (BRIEF.md §10).
@@ -542,6 +560,14 @@ def fit_ballistic(
         track: The track the segment indexes into.
         segment: A segment (typically ``kind="ballistic"``) with materialized ``indices``.
         ctx: Grounding context; supplies ``gravity`` and any metric reference.
+        diameter_m: Optional known physical object size (meters), supplied by a preset
+            (e.g. ``SpherePreset.diameter_m``). When given AND the boxes carry apparent
+            size, the engine runs the **object-size-as-ruler §10 cross-cue check**: it
+            derives an independent meters-per-pixel scale ``D / d_px`` and compares it to the
+            gravity-recovered scale. The check is ONE-SIDED conservative — disagreement (with
+            an informative size channel) lowers confidence and widens the CI; agreement never
+            inflates them — so it can only make the engine more cautious, never over-claim.
+            ``None`` (the default) ⇒ no size logic, behaviour unchanged.
         rng: Optional generator for deterministic RANSAC.
 
     Returns:
@@ -668,6 +694,49 @@ def fit_ballistic(
         systematic_floor = _SYSTEMATIC_REL_FLOOR * (1.0 + guard.ci_widen * score)
         guard_meta = {"in_plane_aspect": aspect, "depth_domination_score": score}
 
+    # Object-size-as-ruler cross-cue consistency check (§10). When a known object size is
+    # supplied, a second, independent meters-per-pixel scale ``D / d_px`` is available from
+    # the apparent box size. It is folded in ONE-SIDED: an informative size channel that
+    # DISAGREES with the gravity scale lowers confidence and widens the CI (it is evidence
+    # the gravity scale is biased, typically by depth motion); agreement never inflates them.
+    # A sub-noise size channel is recorded as uninformative and changes nothing — no signal,
+    # no claim. Flagging a biased scale this way is distinct from RECOVERING depth (stereo).
+    size_meta: dict[str, object] = {}
+    if diameter_m is not None:
+        kept_bboxes = track.bboxes()[kept]
+        reading = read_object_size(apparent_size_px(kept_bboxes), diameter_m)
+        if reading is None:
+            size_meta = {"object_size_ruler": "unavailable"}
+        elif not reading.informative_for_scale:
+            size_meta = {
+                "object_size_ruler": "sub_noise",
+                "size_scale_m_per_px": reading.scale_m_per_px,
+                "size_rel_noise": reading.rel_noise,
+                "size_snr_abs": reading.snr_abs,
+                "size_snr_dyn": reading.snr_dyn,
+            }
+        else:
+            rel_disc, agreement = scale_agreement(
+                reading.scale_m_per_px, scale, tol=_SIZE_AGREEMENT_TOL
+            )
+            confidence = confidence * agreement  # one-sided: max 1.0 (no boost)
+            # Cap the widening at a large but FINITE multiple so a pathological (overflowing)
+            # rel_disc cannot emit a non-finite CI bound. agreement is already 0 in that
+            # regime, so this preserves the maximally-cautious intent while staying finite.
+            widen_disc = rel_disc if np.isfinite(rel_disc) else _SIZE_MAX_WIDEN_DISC
+            widen_disc = min(widen_disc, _SIZE_MAX_WIDEN_DISC)
+            systematic_floor = systematic_floor * (1.0 + _SIZE_CI_WIDEN * widen_disc)
+            size_meta = {
+                "object_size_ruler": "cross_checked",
+                "size_scale_m_per_px": reading.scale_m_per_px,
+                "gravity_scale_m_per_px": scale,
+                "scale_cross_check_rel_disc": rel_disc,
+                "scale_agreement": agreement,
+                "size_snr_abs": reading.snr_abs,
+                "size_snr_dyn": reading.snr_dyn,
+                "size_informative_for_depth": reading.informative_for_depth,
+            }
+
     return _build_metric_estimate(
         xfit, yfit, times, scale, frame_range, segment,
         source="ballistic_fit", confidence=confidence, gof=gof,
@@ -681,6 +750,7 @@ def fit_ballistic(
             "completeness": completeness,
             **shape,
             **guard_meta,
+            **size_meta,
         },
     )
 
