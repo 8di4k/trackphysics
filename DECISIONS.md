@@ -178,3 +178,16 @@ provenance-tagged, valid only for the geometry it was fit on.
 The maturity ladder is now: default path (unchanged) → opt-in depth guard (B, point-only safety
 net, done) → per-deployment calibrator (precision for those who refit, done) → default-ON +
 cross-geometry (awaiting a 2nd domain).
+
+### OOD guard on the calibrator — provenance of the provenance
+
+A calibrator that is silently applied to a geometry it was NOT fit on would return exactly the
+overconfidence it exists to remove — a §10 violation one floor up. So "valid in-distribution"
+is enforced, not just documented: the artifact stores its fit-time support (per-feature box +
+the radius of the standardized point cloud), and :meth:`DeploymentCalibrator.apply` REFUSES an
+out-of-distribution input — it returns the engine's recovered speed unchanged with ``ci95=None``
+(the caller keeps the engine's own CI) and ``in_support=False``. Measured: a calibrator fit on
+one TT3D viewpoint accepts ~all of its own geometry and refuses the large majority of a foreign
+viewpoint, while held-in abstention stays low. The cost of the "reward for calibration" is also
+explicit: fitting needs a **one-time labelled capture** on the rig (metric emissions + ground
+truth) — without labels there is no calibrator.

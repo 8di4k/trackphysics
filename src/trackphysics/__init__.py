@@ -7,7 +7,12 @@ the three-tier provenance types, the preset protocol + registry, the grounding h
 
 from __future__ import annotations
 
-from .calibration import CALIBRATOR_FEATURES, DeploymentCalibrator, features_from_estimate
+from .calibration import (
+    CALIBRATOR_FEATURES,
+    CalibrationResult,
+    DeploymentCalibrator,
+    features_from_estimate,
+)
 from .core.adapters.generic import from_csv, from_generic
 from .core.adapters.supervision import from_supervision
 from .core.analysis import analyze
@@ -39,6 +44,7 @@ __all__ = [
     "CALIBRATOR_FEATURES",
     "AnalysisResult",
     "BounceDetector",
+    "CalibrationResult",
     "DepthDominationGuard",
     "DeploymentCalibrator",
     "Detection",

@@ -96,6 +96,59 @@ The adapter is duck-typed and lives behind an optional extra — the core never 
 floor otherwise, plus generic events, scale-invariant keypoint kinematics, and a
 track-quality report saying *where* the track is unreliable.
 
+## Provenance hardening (optional): depth guard + per-deployment calibration
+
+Real-data validation against independent multi-camera 3D showed the v0.1 metric tier is
+*honest in aggregate* but has two known limits in stress regimes (spin / high drag / motion
+along the optical axis): the gate can over-trust a depth-dominated arc, and the fixed CI
+floor under-covers off-regime. Two **opt-in, default-OFF** mechanisms address this without
+changing default behaviour. Both are recorded as measured limitations in
+[`DECISIONS.md`](DECISIONS.md). Neither *recovers* depth — that needs stereo (v0.2).
+
+**Depth-domination guard** (point-only; no extra data). A trajectory flying along the optical
+axis still fits a clean in-plane parabola, so the gate trusts it even though the in-plane
+speed is a fraction of the true 3D motion. The 2D in-plane aspect ratio is a point-only proxy;
+the guard continuously discounts confidence / widens the CI as it falls, and conservatively
+downgrades `METRIC → RELATIVE` past a hard floor:
+
+```python
+import trackphysics as tp
+ctx = tp.GroundingContext(depth_guard=tp.DepthDominationGuard(enabled=True))
+res = tp.analyze(track, preset="sphere", grounding=ctx)
+```
+
+The default thresholds are *calibrated on one evaluation set* — opt-in, not promoted to
+default-ON until validated on a second domain.
+
+**Per-deployment calibrator** (precision for a fixed rig). A calibrated CI does not generalize
+across camera geometry, but **is** recoverable in-distribution. For a stationary deployment,
+do a **one-time labelled capture** (metric emissions + independent ground-truth speeds — the
+unavoidable cost), fit a calibrator, and persist it:
+
+```python
+cal = tp.DeploymentCalibrator.fit(feature_rows, recovered, truth, provenance="court-3-cam-A")
+json.dump(cal.to_dict(), open("court-3.json", "w"))           # save the refittable artifact
+```
+
+At inference, apply it to each metric estimate. It de-biases the speed and replaces the fixed
+CI floor with an **input-conditioned** CI — and it **refuses out-of-distribution inputs** (the
+provenance of the provenance): outside its fit-time support it returns the engine's speed
+unchanged with `ci95=None` (use the engine's own CI), so a calibrator applied to the wrong
+geometry cannot hand back overconfidence:
+
+```python
+cal = tp.DeploymentCalibrator.from_dict(json.load(open("court-3.json")))
+r = cal.apply_to(res.trajectory)        # CalibrationResult
+if r.in_support:
+    speed, ci = r.speed_m_s, r.ci95     # de-biased speed + calibrated CI
+else:
+    ...                                 # out-of-distribution: fall back to the engine's estimate
+```
+
+Coefficients are deployment-specific and never enter the domain-agnostic core (§6). See the
+fitters under [`validation/`](validation/) (`make_tt3d_dump`, `calibrate`,
+`fit_deployment_calibrator`, `depth_guard_operating_point`).
+
 ## Benchmark — the accuracy/robustness envelope
 
 Run `python -m bench.run` to regenerate the full report (numbers + plots) under

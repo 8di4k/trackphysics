@@ -15,6 +15,16 @@ rig it was fit on; applying it cross-geometry is a misuse.
 It is a REFITTABLE ARTIFACT, never hardcoded into the core (§6): the coefficients are
 deployment-specific. Serialize with :meth:`DeploymentCalibrator.to_dict` /
 :meth:`from_dict` (plain JSON-able dicts).
+
+Two honesty properties make it safe to ship:
+
+* **A one-time LABELLED capture is required to fit.** ``fit`` needs the rig's metric emissions
+  paired with independent ground-truth speeds; without labels there is no calibrator. That is
+  the price of "reward for calibration".
+* **It refuses out-of-distribution inputs.** :meth:`apply` checks the input against the
+  fit-time support and, when outside it, returns the engine's speed unchanged with no CI
+  (``in_support=False``) rather than a confident-but-wrong recalibration — see
+  :class:`CalibrationResult`.
 """
 
 from __future__ import annotations
@@ -27,7 +37,12 @@ import numpy as np
 from .core.provenance import Tier, TrajectoryEstimate
 from .core.schema import FloatArray
 
-__all__ = ["CALIBRATOR_FEATURES", "DeploymentCalibrator", "features_from_estimate"]
+__all__ = [
+    "CALIBRATOR_FEATURES",
+    "CalibrationResult",
+    "DeploymentCalibrator",
+    "features_from_estimate",
+]
 
 CALIBRATOR_FEATURES: tuple[str, ...] = (
     "residual_fraction", "inlier_fraction", "completeness", "a_px", "gof",
@@ -61,6 +76,27 @@ def _design(z: FloatArray) -> FloatArray:
 
 
 @dataclass
+class CalibrationResult:
+    """Outcome of applying a :class:`DeploymentCalibrator` to one metric emission.
+
+    ``in_support`` is the load-bearing field: a calibrator is honest ONLY on inputs that
+    resemble its fit set (a fixed geometry). When the input falls outside that support the
+    de-bias and the input-conditioned CI would themselves be over-confident — the §10 sin one
+    floor up — so the calibrator REFUSES: it returns the engine's original speed unchanged and
+    ``ci95=None`` (the caller keeps the engine's own CI), with ``in_support=False``.
+    """
+
+    speed_m_s: float
+    """De-biased speed when ``in_support``; the engine's original recovered speed otherwise."""
+    ci95: tuple[float, float] | None
+    """Input-conditioned CI when ``in_support``; ``None`` otherwise (fall back to the engine CI)."""
+    in_support: bool
+    support_distance: float
+    """Standardized (diagonal-Mahalanobis) distance of the input from the fit-set centre, for
+    diagnostics / softer policies than the hard refusal."""
+
+
+@dataclass
 class DeploymentCalibrator:
     """A fitted per-deployment recalibration (de-bias + input-conditioned CI).
 
@@ -80,6 +116,13 @@ class DeploymentCalibrator:
     coverage: float
     provenance: str
     n_fit: int
+    feature_min: list[float]
+    """Per-feature fit-time minimum (the support box, for the OOD check)."""
+    feature_max: list[float]
+    """Per-feature fit-time maximum."""
+    support_radius: float
+    """Fit-time standardized-distance radius (max diagonal-Mahalanobis distance over the fit
+    set): an input beyond this — or outside the per-feature box — is out-of-distribution."""
 
     @classmethod
     def fit(
@@ -119,6 +162,9 @@ class DeploymentCalibrator:
         scale_coef, *_ = np.linalg.lstsq(design, np.log(np.abs(residual) + 1e-6), rcond=None)
         sigma = np.exp(design @ scale_coef)
         ci_k = float(np.quantile(np.abs(residual) / np.maximum(sigma, 1e-9), coverage))
+        # Fit-time support, for the OOD guard: the per-feature box and the radius of the
+        # standardized point cloud. An input outside either is out-of-distribution.
+        support_radius = float(np.max(np.sqrt(np.sum(z * z, axis=1)))) if z.shape[0] else 0.0
         return cls(
             feature_names=tuple(feature_names),
             mean=[float(v) for v in mean],
@@ -129,30 +175,68 @@ class DeploymentCalibrator:
             coverage=coverage,
             provenance=provenance,
             n_fit=int(x.shape[0]),
+            feature_min=[float(v) for v in np.min(x, axis=0)],
+            feature_max=[float(v) for v in np.max(x, axis=0)],
+            support_radius=support_radius,
         )
 
-    def _augmented(self, features: Mapping[str, float]) -> FloatArray:
+    def _standardized(self, features: Mapping[str, float]) -> FloatArray:
         x = np.array([float(features[n]) for n in self.feature_names], dtype=np.float64)
         z = np.nan_to_num((x - np.asarray(self.mean)) / np.asarray(self.std))
-        return np.append(z, 1.0)
+        return np.asarray(z, dtype=np.float64)
 
-    def apply(
-        self, features: Mapping[str, float], recovered_speed: float
-    ) -> tuple[float, tuple[float, float]]:
-        """Recalibrate a single emission: returns ``(debiased_speed, (lo, hi))``.
+    def support_check(
+        self,
+        features: Mapping[str, float],
+        *,
+        box_margin: float = 0.05,
+        radius_margin: float = 0.10,
+    ) -> tuple[bool, float]:
+        """Is ``features`` within the calibrator's fit-time support? Returns ``(in, distance)``.
 
-        The CI is fully input-conditioned (it replaces the engine's fixed systematic floor):
-        a half-width ``ci_k * exp(scale_model(features))`` calibrated to ``coverage`` on the
-        deployment's fit set.
+        Two cheap, conservative checks (bias toward declaring OOD, since falling back to the
+        engine default is the safe under-claim): (1) every feature within its fit-time
+        ``[min, max]`` extended by ``box_margin`` of the range, and (2) the standardized
+        distance within ``support_radius`` extended by ``radius_margin``. A NaN feature is OOD.
         """
-        aug = self._augmented(features)
+        x = np.array([float(features[n]) for n in self.feature_names], dtype=np.float64)
+        if not np.all(np.isfinite(x)):
+            return False, float("inf")
+        lo = np.asarray(self.feature_min)
+        hi = np.asarray(self.feature_max)
+        span = np.maximum(hi - lo, 1e-9)
+        in_box = bool(np.all(x >= lo - box_margin * span) and np.all(x <= hi + box_margin * span))
+        distance = float(np.sqrt(np.sum(self._standardized(features) ** 2)))
+        in_radius = distance <= self.support_radius * (1.0 + radius_margin)
+        return (in_box and in_radius), distance
+
+    def apply(self, features: Mapping[str, float], recovered_speed: float) -> CalibrationResult:
+        """Recalibrate a single emission, REFUSING out-of-distribution inputs.
+
+        When ``features`` are within the fit-time support, returns the de-biased speed and an
+        input-conditioned CI (half-width ``ci_k * exp(scale_model(features))``, calibrated to
+        ``coverage`` on the deployment's fit set). When they are OUT of support, the calibrator
+        would itself be over-confident, so it refuses: the original ``recovered_speed`` is
+        returned unchanged with ``ci95=None`` (use the engine's own CI) and
+        ``in_support=False``. This is the OOD guard — the provenance of the provenance.
+        """
+        in_support, distance = self.support_check(features)
+        if not in_support:
+            return CalibrationResult(
+                speed_m_s=float(recovered_speed), ci95=None,
+                in_support=False, support_distance=distance,
+            )
+        aug = np.append(self._standardized(features), 1.0)
         bias_hat = float(aug @ np.asarray(self.bias_coef))
         debiased = float(recovered_speed) - bias_hat
         sigma = float(np.exp(aug @ np.asarray(self.scale_coef)))
         half = self.ci_k * sigma
-        return debiased, (debiased - half, debiased + half)
+        return CalibrationResult(
+            speed_m_s=debiased, ci95=(debiased - half, debiased + half),
+            in_support=True, support_distance=distance,
+        )
 
-    def apply_to(self, est: TrajectoryEstimate) -> tuple[float, tuple[float, float]]:
+    def apply_to(self, est: TrajectoryEstimate) -> CalibrationResult:
         """Convenience: read features + recovered speed straight off a METRIC estimate."""
         feats = features_from_estimate(est)
         if feats is None:

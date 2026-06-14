@@ -65,28 +65,40 @@ def main() -> None:
     n = len(rows)
     print(f"loaded {n} METRIC rows with finite features from {args.dump}")
     idx = np.arange(n)
-    raw_b, deb_b, cov_engine, cov_cal = [], [], [], []
+    raw_b: list[float] = []
+    deb_b: list[float] = []
+    cov_engine: list[float] = []
+    cov_cal: list[float] = []
+    abstain: list[float] = []
     for f in range(args.folds):
         te = idx % args.folds == f
         tr = ~te
         cal = DeploymentCalibrator.fit(
             [rows[i] for i in idx[tr]], rec[tr], truth[tr], provenance=f"pooled-fold{f}"
         )
-        rb, db, ce, cc = [], [], 0, 0
+        rb: list[float] = []
+        db: list[float] = []
+        ce = cc = applied = n_ood = 0
         for i in idx[te]:
-            speed, (lo, hi) = cal.apply(rows[i], float(rec[i]))
-            rb.append(abs(rec[i] - truth[i]))
-            db.append(abs(speed - truth[i]))
-            ce += int(ci_lo[i] <= truth[i] <= ci_hi[i])
-            cc += int(lo <= truth[i] <= hi)
-        raw_b.append(np.mean(rb))
-        deb_b.append(np.mean(db))
+            res = cal.apply(rows[i], float(rec[i]))
+            ce += int(ci_lo[i] <= truth[i] <= ci_hi[i])  # engine fixed-floor baseline
+            if res.in_support and res.ci95 is not None:
+                rb.append(abs(rec[i] - truth[i]))
+                db.append(abs(res.speed_m_s - truth[i]))
+                cc += int(res.ci95[0] <= truth[i] <= res.ci95[1])
+                applied += 1
+            else:
+                n_ood += 1  # OOD: calibrator abstained, engine CI stands
+        raw_b.append(float(np.mean(rb)) if rb else float("nan"))
+        deb_b.append(float(np.mean(db)) if db else float("nan"))
         cov_engine.append(ce / int(te.sum()))
-        cov_cal.append(cc / int(te.sum()))
+        cov_cal.append(cc / applied if applied else float("nan"))
+        abstain.append(n_ood / int(te.sum()))
     print(f"pooled {args.folds}-fold (geometry in-distribution):")
-    print(f"  |bias|        raw={np.mean(raw_b):.3f} -> de-biased={np.mean(deb_b):.3f}")
-    print(f"  CI coverage   engine(fixed floor)={np.mean(cov_engine):.2f}  "
-          f"calibrator(input-conditioned)={np.mean(cov_cal):.2f}   (target 0.95)")
+    print(f"  |bias| (applied)  raw={np.nanmean(raw_b):.3f} -> de-biased={np.nanmean(deb_b):.3f}")
+    print(f"  CI coverage       engine(fixed floor)={np.mean(cov_engine):.2f}  "
+          f"calibrator(input-conditioned, on accepted)={np.nanmean(cov_cal):.2f}   (target 0.95)")
+    print(f"  OOD-abstain rate (held-in, should be low)={np.mean(abstain):.2f}")
 
     if args.out:
         cal_all = DeploymentCalibrator.fit(rows, rec, truth, provenance=f"fit_on_all:{args.dump}")
