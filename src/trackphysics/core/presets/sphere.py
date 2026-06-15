@@ -79,7 +79,10 @@ class SpherePreset:
                 "SpherePreset.fit needs a track: pass a segment from detect_segments "
                 "(which attaches source_track) or call bind(track) first"
             )
-        return fit_ballistic(track, segment, ctx)
+        # ``diameter_m`` is advisory: when a domain layer supplies the object's true size it
+        # enables the object-size-as-ruler §10 cross-cue check inside the fit; when None
+        # (the default registered preset) the fit behaves exactly as before.
+        return fit_ballistic(track, segment, ctx, diameter_m=self.diameter_m)
 
     def event_detectors(self) -> list[EventDetector]:
         """Return this preset's event detectors.

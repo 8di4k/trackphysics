@@ -120,6 +120,31 @@ res = tp.analyze(track, preset="sphere", grounding=ctx)
 The default thresholds are *calibrated on one evaluation set* — opt-in, not promoted to
 default-ON until validated on a second domain.
 
+**Object-size cross-check** (a second, independent ruler — opt-in by *data*). If you know the
+object's true size, supply it: under a pinhole camera the local scale is `meters/pixel = D /
+apparent_diameter_px`, independent of focal length — a second ruler beside gravity. Supplying
+`diameter_m` turns on a §10 cross-cue check inside the fit:
+
+```python
+res = tp.analyze(track, preset=tp.SpherePreset(diameter_m=0.040), grounding=tp.GroundingContext())
+```
+
+It is **one-sided conservative**: an *informative* size channel that disagrees with the
+gravity-recovered scale lowers confidence and widens the CI (independent evidence of a
+depth-biased scale); agreement never inflates them, and a sub-noise size channel changes
+nothing — so it can only make the engine more cautious, never over-claim. The default preset
+(`diameter_m=None`) is unchanged.
+
+A synthetic SNR study (`python -m bench.size_ruler` →
+[`bench/report/size_ruler.md`](bench/report/size_ruler.md)) maps *when* the channel is usable —
+and the answer is **region-scoped, not "size is weak"**: the ruler is exact when clean, and
+usefulness tracks `snr_abs = median(d_px)/σ_d`. *Below* the gate (small/distant objects — a
+few-pixel object whose apparent size barely changes) it is only a marginal absolute cross-check
+and depth recovery is infeasible. *Above* the gate (large/close objects — diameter tens–hundreds
+of px) it is a **strong absolute-scale cue** that competes with gravity and partially substitutes
+for stereo *for scale* (this high-SNR regime is synthetic-only / unvalidated on real data). Either
+way it *flags* a biased scale but does not *recover* the missing depth — that still needs stereo.
+
 **Per-deployment calibrator** (precision for a fixed rig). A calibrated CI does not generalize
 across camera geometry, but **is** recoverable in-distribution. For a stationary deployment,
 do a **one-time labelled capture** (metric emissions + independent ground-truth speeds — the

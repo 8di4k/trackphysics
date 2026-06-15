@@ -191,3 +191,109 @@ one TT3D viewpoint accepts ~all of its own geometry and refuses the large majori
 viewpoint, while held-in abstention stays low. The cost of the "reward for calibration" is also
 explicit: fitting needs a **one-time labelled capture** on the rig (metric emissions + ground
 truth) — without labels there is no calibrator.
+
+---
+
+## 2026-06-15 — Object-size-as-ruler: a second monocular scale cue, gated by its own SNR
+
+The queued §10 item ("object-size-as-a-ruler cross-checked against gravity-as-a-ruler") is now
+built and **measured on synthetic ground truth**, answering the long-standing "do we need stereo
+or does a detector's apparent-size channel carry scale?" question — *without* the raw-detector run
+that question seemed to require.
+
+**Why this experiment, not a raw-detector pass.** A single YOLO-on-real-video run confounds two
+unknowns ("is size-as-ruler viable at SNR *X*" and "what SNR does this dataset/detector produce")
+and yields one point we can already predict from published intrinsics. The synthetic generator
+already emits the exact apparent size (`d_px = f·D/Z`), so a controlled noise sweep gives a
+**generalizable** answer (a gate threshold as a function of SNR, valid for any object/distance)
+and the real regime is placed on it analytically. It also needed **zero new data**: TT3D as the
+engine consumes it is point-only with constant synthetic boxes (no size channel at all); the raw
+side/oblique video exists but is off-machine, license-unsettled, and only two viewpoints — and it
+would not unblock cross-geometry anyway (same three views; the blocker there is viewpoint
+*continuum*, not a feature).
+
+**The mechanism (generic, §6-clean).** Under a pinhole camera the local meters-per-pixel scale is
+`s = D / d_px` — independent of focal length and depth — so a *known* object size is a second
+ruler beside gravity. `core/objsize.py` computes it; the known size is the preset's advisory
+`diameter_m` (opaque positive length to the core, never semantics). `core/shape.py`'s sibling and
+this share one apparent-size definition (`apparent_size_px`, also used by the relative-3D lift, so
+the inverse-depth proxy and the ruler never diverge). The guardrail test confirms no domain terms
+entered core.
+
+**DECIDED — there is no single "stereo vs size" answer; it splits by job, along two SNRs.**
+* **Absolute scale** `D/median(d_px)` needs low *relative* size noise: `snr_abs = median(d_px)/σ_d`.
+* **Depth-motion recovery** (the missing out-of-plane axis) needs apparent-size *dynamic range* to
+  beat noise: `snr_dyn = ptp(d_px_trend)/σ_d`.
+These come apart for a *small, distant* object. Measured on synthetic (committed,
+`bench/size_ruler.py` → `bench/report/size_ruler.{md,png,json}`; these are OUR synthetic numbers,
+not TT3D's):
+  - the size ruler is **exact when clean** (0.0% per-frame scale error — it inverts the projection);
+  - the **SNR gate breakpoint** is `snr_abs ≈ 7.2` for a 10% scale error (~invariant to object
+    size/distance — verified across diameters: `snr_abs ≈ 7.2–7.4`);
+  - the **size↔gravity cross-check flags a biased gravity scale, whatever the cause.** Two distinct
+    violations, both caught: **depth motion** (a *level* camera with along-axis motion — image-y
+    still maps to world-vertical, so the bias is purely the constant-depth violation, the documented
+    §10 limitation) gives ~36% gravity error / ~27% cross-check discrepancy; **camera tilt** (a
+    *different* violation — world-vertical no longer maps to image-y) gives ~58% / ~37%. Both vs <1%
+    side-on. (Earlier framing that called the steep-tilt arc "the depth-blindness surface" was a
+    mis-attribution — its bias is dominated by the vertical-axis mis-map, not depth; the genuine
+    level-camera depth case is the correct §10 demonstrator. The cross-check catches *both*.)
+    *Flagging the bias is still not recovering the depth.*
+
+**DECIDED — size-ruler usefulness is REGION-SCOPED by `snr_abs`, not a universal "size is weak."**
+Do not over-generalize the ping-pong result. Two regimes, split by the gate:
+- **Below the gate** (`snr_abs ≲ 7`) — *small/distant* objects. Published-intrinsic numbers for a
+  ~40 mm object at a few meters (`d ≈ 8–14 px`, box noise ≈ 1 px ⇒ `snr_abs ≈ 10`; apparent-size
+  change over the depth swing ≈ 1–4 px ⇒ `snr_dyn ≈ 1–4`): at `snr_abs ≈ 10` the **measured** curve
+  gives ~7% size-scale error — a **marginal absolute cross-check, not a tight ruler** — and depth
+  recovery is **infeasible** (`snr_dyn` at/below the refittable `min_snr_dyn = 3`, judged *by
+  threshold, not measured* — no depth-recovery sweep exists; that path is unimplemented). This is
+  exactly the regime where size *must* fail; it is **not** an indictment of the cue in general.
+- **Above the gate** — *large/close* objects (basketball, thrown box, robo-manipulator payload:
+  diameter tens–hundreds of px, `snr_abs ≫ gate`). Here object-size-as-ruler is a **STRONG
+  absolute-scale cue** that genuinely competes with gravity-as-a-ruler and **partially substitutes
+  for stereo *for scale*** (depth-*velocity* recovery from apparent size is hard even there). This
+  regime is **NOT testable on TT3D** (it cannot reach high SNR) and is **UNVALIDATED on real data**.
+
+So the honest claim is: **size is useless below the `snr_abs` gate (small/distant) and a strong
+scale cue above it (large/close, untested on real data)** — *not* "size is a weak flag" generally.
+The §10 takeaway is unchanged: size **flags** a depth-biased gravity scale; *recovering* the
+missing depth still needs stereo, and the documented depth-blindness limitation stands for recovery.
+
+**Thresholds are synthetic-calibrated; the one real-detector run worth doing is high-SNR.** The
+gate values (`snr_abs ≈ 6.9–7.2`, `snr_dyn ≥ 3`) come from synthetic box-size noise. The single
+real-detector pass that would *add* information is confirming the high-SNR thresholds on a
+large/close object — **not** another ping-pong pass (whose result the pixel math already predicts).
+
+**Bench keeps in-plane / depth / tilt as permanently SEPARATE geometry axes.** Two confounds of the
+same class have now been caught — tilt-vs-depth (earlier, BENCH-03) and skew-vs-depth (this review,
+where a "steep" camera's bias was mostly vertical-axis mis-map, not depth). A pitched camera is a
+*tilt* axis, not a *depth* axis; the depth-domination demonstrator must be a LEVEL camera. Do not
+merge these axes — `bench/size_ruler.py` carries all three (`side_on` / `depth_motion` / `steep_tilt`)
+with the depth case held at ~0° pitch, asserted in the smoke so it cannot silently regress.
+
+**Engine change, §10-safe by construction.** The cross-check is folded into `fit_ballistic` only
+when a known `diameter_m` is supplied (so the default registered preset, `diameter_m=None`, is
+byte-for-byte unchanged — opt-in by *data*, no flag). It is **one-sided conservative**: an
+*informative* size channel that **disagrees** lowers confidence and widens the CI (independent
+evidence the gravity scale is biased); agreement never inflates them; a **sub-noise** channel is
+recorded as uninformative and changes nothing (no signal, no claim). So the cue can only make the
+engine more cautious — it cannot manufacture a metric over-claim. Thresholds
+(`SizeRulerThresholds`, `_SIZE_AGREEMENT_TOL`, `_SIZE_CI_WIDEN`) are refittable, calibrated on the
+synthetic sweep — not universal constants.
+
+### §10 AMENDMENT (cross-cue consistency, a strengthening)
+
+> When a known object size is supplied and its apparent-size channel is **informative**
+> (`rel_noise ≤ max_rel_noise`), the engine MUST cross-check the size-derived scale against the
+> gravity-derived scale and **widen the CI / discount confidence on disagreement** — an independent
+> ruler that contradicts the recovered scale is evidence the latter is biased (typically by depth
+> motion). The cross-check may never *raise* confidence (shared failure modes), and a sub-noise
+> size channel must be treated as no evidence, not as confirmation. "Tight metric CI while an
+> informative independent ruler disagrees" is a §10 violation.
+
+**Scope / next.** Letting the size ruler *emit* METRIC on its own when gravity fails (an
+independent scale source, not just a cross-check) is the queued follow-up — opt-in and default-OFF,
+because it is synthetic-validated only (we have no real size-bearing ground truth yet); it should
+ship like the depth guard did, never as hardcoded behaviour. Folding `snr_dyn` into the depth guard
+(size as a second depth-domination flag beside aspect) is a further extension.
